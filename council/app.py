@@ -509,6 +509,9 @@ class CouncilApp(App):
         await self._launch(s, d, lambda: d.run(start_round=d.round, extra_rounds=n))
 
     async def _launch(self, s: Session, d: Debate, job):
+        # /continue после /stop переиспользует Debate: снимаем прежнюю отмену до старта потока,
+        # чтобы /stop, нажатый сразу после запуска, не потерялся
+        d.cancel.clear()
         self.debates[s.id] = d
         self.running.add(s.id)
         s.set(status="running")
