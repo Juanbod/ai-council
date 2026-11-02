@@ -24,9 +24,17 @@ REJECT — ни один кандидат пока не годится; ABSTAIN 
 - Консенсус — когда оба в одном раунде приняли один и тот же id.
 - Ты работаешь только на чтение: ничего не изменяй в файлах.
 - Комментарии председателя имеют приоритет.
+- Яйца (по традиции Верховной Рады Украины). У каждого участника на всё обсуждение {eggs} яйца — \
+сколько осталось, видно в eggs_left. Бросить яйцо в оппонента (egg = за что, одной фразой) можно \
+только в знак КРАЙНЕГО несогласия: оппонент игнорирует твои аргументы, ходит по кругу или упорствует \
+в явной ошибке. Яйцо срывает голосование: в раунде, где летело яйцо, консенсус не засчитывается. \
+В раунде 0 бросать не в кого. Обычное несогласие выражай голосом REJECT, а не яйцом.
 
 Ответ — строго JSON по схеме: position (твоя текущая позиция), critique (критика оппонента и ответы \
-на его вопросы), questions (вопросы оппоненту), vote, vote_id, new_proposal ("" если нет)."""
+на его вопросы), questions (вопросы оппоненту), vote, vote_id, new_proposal ("" если нет), \
+egg ("" если не бросаешь)."""
+
+EGGS_PER_DEBATE = 3
 
 
 def proposal_id(text: str) -> str:
@@ -37,10 +45,10 @@ class Debate:
     """Одно обсуждение вопроса председателя. emit(event) вызывается из рабочего потока."""
 
     def __init__(self, agents: list[Agent], session, question: str, emit,
-                 max_rounds: int = 5, history_full_rounds: int = 2):
+                 max_rounds: int = 5, history_full_rounds: int = 2, eggs: int = EGGS_PER_DEBATE):
         assert len(agents) == 2, "протокол рассчитан на двух участников"
         self.agents, self.session, self.question = agents, session, question
-        self.emit, self.max_rounds = emit, max_rounds
+        self.emit, self.max_rounds, self.eggs = emit, max_rounds, eggs
         self.history_full_rounds = history_full_rounds
         self.cancel = threading.Event()
         self.chair_notes: queue.Queue[str] = queue.Queue()
@@ -80,8 +88,9 @@ class Debate:
             if complete:
                 for name in (a.name for a in agents):
                     e = att["replies"][name]
-                    d.log.append({k: e[k] for k in ("round", "agent", "position", "critique",
-                                                     "questions", "vote", "vote_id", "proposed")})
+                    d.log.append({**{k: e[k] for k in ("round", "agent", "position", "critique",
+                                                        "questions", "vote", "vote_id", "proposed")},
+                                  "egg": e.get("egg", "")})  # в старых протоколах яиц нет
                     if e.get("proposed") and e["proposed"] not in {c["id"] for c in d.candidates}:
                         d.candidates.append({"id": e["proposed"], "author": e["agent"],
                                              "round": e["round"], "text": e["proposal_text"]})
@@ -90,6 +99,12 @@ class Debate:
             d.notes.extend({"round": next_round, "text": t} for t in att["notes"])
         d.round = next_round
         return d
+
+    # --- яйца ---
+    def eggs_left(self) -> dict[str, int]:
+        """Запас считается по протоколу, поэтому переживает /stop и перезапуск."""
+        return {a.name: self.eggs - sum(1 for e in self.log if e["agent"] == a.name and e.get("egg"))
+                for a in self.agents}
 
     # --- контекст ---
     def _prior_decisions(self) -> list[dict]:
@@ -126,13 +141,14 @@ class Debate:
             "chair_notes": list(self.notes),
             "debate_log": self._compact_log(),
             "candidates": list(self.candidates),
+            "eggs_left": self.eggs_left(),
         }
         attachments = [Path(self.session.files_dir) / f.rstrip("/") for f in files]
         return json.loads(json.dumps(shared, ensure_ascii=False)), attachments
 
     def _prompt(self, me: Agent, other: Agent, shared: dict) -> str:
         state = {"you": me.name, "opponent": other.name, **shared}
-        intro = RULES.format(me=me.name, other=other.name)
+        intro = RULES.format(me=me.name, other=other.name, eggs=self.eggs)
         if shared["files"]:
             intro += "\n\nФайлы заседания лежат в рабочей папке в каталоге files/."
         return (intro + "\n\nСостояние заседания (JSON) после метки:\n<<STATE>>"
@@ -160,7 +176,7 @@ class Debate:
                            "text": f"попытка {attempt + 1}: {last_err}"})
         # сбой участника = несогласие, а не молчаливое ACCEPT
         return {"ok": False, "position": "", "critique": f"[сбой: {last_err}]", "questions": [],
-                "vote": "REJECT", "vote_id": "", "new_proposal": ""}
+                "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": ""}
 
     def add_chair_note(self, text: str):
         self.chair_notes.put(text)
@@ -190,12 +206,15 @@ class Debate:
                     raise Cancelled()
 
                 known = {c["id"] for c in self.candidates}
+                eggs = self._eggs_thrown(replies)
                 votes = [(r["vote"], r["vote_id"]) for r in replies.values()]
-                consensus_id = None
+                agreed_id = None
                 if self.round > 0 and all(v == "ACCEPT" for v, _ in votes):
                     ids = {i for _, i in votes}
                     if len(ids) == 1 and next(iter(ids)) in known:
-                        consensus_id = next(iter(ids))
+                        agreed_id = next(iter(ids))
+                # летевшее яйцо срывает голосование
+                consensus_id = None if any(eggs.values()) else agreed_id
 
                 # ответы добавляются в протокол только после завершения пары вызовов
                 for ag in self.agents:
@@ -209,11 +228,15 @@ class Debate:
                             known.add(new_id)
                     entry = {"round": self.round, "agent": ag.name, "position": r["position"],
                              "critique": r["critique"], "questions": r["questions"],
-                             "vote": r["vote"], "vote_id": r["vote_id"], "proposed": new_id}
+                             "vote": r["vote"], "vote_id": r["vote_id"], "proposed": new_id,
+                             "egg": eggs[ag.name]}
                     self.log.append(entry)
                     self.emit({"kind": "reply", "ok": r["ok"], **entry,
                                "proposal_text": r["new_proposal"].strip()})
 
+                if agreed_id and not consensus_id:
+                    self.emit({"kind": "system", "text": "🥚 Голосование сорвано: летели яйца. "
+                                                         "Консенсус в этом раунде не засчитан."})
                 if consensus_id:
                     text = next(c["text"] for c in self.candidates if c["id"] == consensus_id)
                     return self._finish(True, consensus_id, text)
@@ -223,10 +246,24 @@ class Debate:
             self.emit({"kind": "system", "text": "Обсуждение остановлено председателем."})
             return self._finish(False, "", "", stopped=True)
 
+    def _eggs_thrown(self, replies: dict) -> dict[str, str]:
+        """Принятые яйца раунда: {участник: за что}. В раунде 0 и без запаса яйцо не летит."""
+        left = self.eggs_left()
+        out = {}
+        for name, r in replies.items():
+            egg = r.get("egg", "").strip()
+            if egg and (self.round == 0 or left[name] <= 0):
+                why = "в раунде 0 бросать не в кого" if self.round == 0 else "яйца кончились"
+                self.emit({"kind": "warning", "agent": name, "text": f"замахнулся яйцом, но {why}"})
+                egg = ""
+            out[name] = egg
+        return out
+
     def _finish(self, consensus: bool, cid: str, text: str, stopped=False) -> dict:
         verdict = {"kind": "verdict", "question": self.question, "consensus": consensus,
                    "id": cid, "answer": text, "rounds": self.round, "stopped": stopped,
                    "candidates": self.candidates,
+                   "eggs": {n: self.eggs - k for n, k in self.eggs_left().items()},
                    "last_positions": {e["agent"]: e["position"] for e in self.log[-2:]}}
         self.emit(verdict)
         return verdict

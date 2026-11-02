@@ -119,3 +119,19 @@ def test_parse_paths(tmp_path):
     a.write_text("x")
     assert parse_paths(f'"{a}"') == [a]
     assert parse_paths("просто текст") is None
+
+
+@pytest.mark.asyncio
+async def test_eggs_shown_in_feed_and_export(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_mod, "BASE", tmp_path)
+    app = CouncilApp(mock="hothead,agree")
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Рада")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert s.meta["status"] == "consensus"
+        await type_and_send(pilot, "/export")
+        protocol = (s.root / "protocol.md").read_text(encoding="utf-8")
+        assert "Бросает яйцо" in protocol and "Брошено яиц: Claude — 3, Codex — 0" in protocol

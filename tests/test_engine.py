@@ -87,7 +87,7 @@ def test_resume_from_events(session):
 
 def test_extract_json_not_greedy():
     text = 'код: {"a": 1} и ответ {"position": "p", "critique": "", "questions": [], ' \
-           '"vote": "ABSTAIN", "vote_id": "", "new_proposal": "x {y}"} конец {"z": 2}'
+           '"vote": "ABSTAIN", "vote_id": "", "new_proposal": "x {y}", "egg": ""} конец {"z": 2}'
     assert extract_json(text)["new_proposal"] == "x {y}"
 
 
@@ -157,7 +157,7 @@ def test_accept_of_id_proposed_in_same_round_is_not_consensus(session):
     class Eager(MockAgent):
         def ask(self, prompt, workdir, attachments, cancel=None):
             return json.dumps({"position": "p", "critique": "", "questions": [], "vote": "ACCEPT",
-                               "vote_id": proposal_id(text), "new_proposal": text})
+                               "vote_id": proposal_id(text), "new_proposal": text, "egg": ""})
 
     session.append({"kind": "question", "text": "q"})
     d = Debate([Eager("Claude"), Eager("Codex")], session, "q", session.append, max_rounds=3)
@@ -241,3 +241,81 @@ def test_store_returns_one_instance_per_id(tmp_path):
     store = Store(tmp_path)
     s = store.create("A")
     assert store.list()[0] is s
+
+
+# ---------- яйца (как в Верховной Раде) ----------
+
+def scripted(text, egg_rounds):
+    """Оба сразу голосуют за общий текст; яйцо — только в указанных раундах."""
+    class Scripted(MockAgent):
+        def ask(self, prompt, workdir, attachments, cancel=None):
+            st = json.loads(prompt.rsplit("<<STATE>>", 1)[1])
+            return json.dumps({"position": "p", "critique": "", "questions": [], "vote": "ACCEPT",
+                               "vote_id": proposal_id(text), "new_proposal": text,
+                               "egg": "за упрямство" if st["round"] in egg_rounds else ""})
+    return Scripted
+
+
+def test_egg_blocks_consensus_in_its_round(session):
+    text = "Общий ответ"
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([scripted(text, {1})("Claude"), scripted(text, set())("Codex")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=3)
+    v = d.run()
+    assert v["consensus"] and v["rounds"] == 2  # в раунде 1 было бы согласие, но летело яйцо
+    assert any(e["kind"] == "system" and "сорвано" in e["text"] for e in events)
+    assert v["eggs"] == {"Claude": 1, "Codex": 0}
+
+
+def test_no_eggs_in_blind_round(session):
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([scripted("x", {0})("Claude"), scripted("x", set())("Codex")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=2)
+    v = d.run()
+    assert v["consensus"] and v["rounds"] == 1 and v["eggs"]["Claude"] == 0
+    assert any(e["kind"] == "warning" and "раунде 0" in e["text"] for e in events)
+
+
+def test_eggs_run_out_and_consensus_follows(session):
+    """hothead бросает яйцо каждый раунд; agree уже согласен. Пока есть яйца, консенсуса нет."""
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([MockAgent("Claude", "hothead"), MockAgent("Codex", "agree")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=10, eggs=2)
+    v = d.run()
+    assert v["consensus"] and v["rounds"] == 3 and v["eggs"] == {"Claude": 2, "Codex": 0}
+    assert any(e["kind"] == "warning" and "кончились" in e["text"] for e in events)
+
+
+def test_snapshot_shows_same_egg_stock_to_both(session):
+    seen = {}
+
+    class Spy(MockAgent):
+        def ask(self, prompt, *a, **k):
+            st = json.loads(prompt.rsplit("<<STATE>>", 1)[1])
+            seen.setdefault(st["round"], []).append(st["eggs_left"])
+            return super().ask(prompt, *a, **k)
+
+    session.append({"kind": "question", "text": "q"})
+    Debate([Spy("Claude", "hothead"), Spy("Codex", "stubborn")], session, "q", session.append,
+           max_rounds=2).run()
+    assert all(a == b for a, b in seen.values())
+    assert seen[2][0] == {"Claude": 2, "Codex": 3}  # яйцо раунда 1 уже учтено
+
+
+def test_resume_keeps_egg_stock_and_reads_old_protocols(session):
+    run(session, MockAgent("Claude", "hothead"), MockAgent("Codex", "stubborn"), rounds=2)
+    d = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], session, session.append)
+    assert d.eggs_left() == {"Claude": 1, "Codex": 3}
+
+    old = Store(session.root.parent).create("Старое")  # протокол до появления яиц
+    old.append({"kind": "question", "text": "q"})
+    old.append({"kind": "round", "round": 0, "text": "Независимый анализ"})
+    for name in ("Claude", "Codex"):
+        old.append({"kind": "reply", "ok": True, "round": 0, "agent": name, "position": "p",
+                    "critique": "", "questions": [], "vote": "ABSTAIN", "vote_id": "",
+                    "proposed": "", "proposal_text": ""})
+    d2 = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], old, old.append)
+    assert d2.round == 1 and d2.eggs_left() == {"Claude": 3, "Codex": 3}
