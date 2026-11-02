@@ -12,7 +12,7 @@ from pathlib import Path
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["position", "critique", "questions", "vote", "vote_id", "new_proposal"],
+    "required": ["position", "critique", "questions", "vote", "vote_id", "new_proposal", "egg"],
     "properties": {
         "position": {"type": "string"},
         "critique": {"type": "string"},
@@ -20,6 +20,8 @@ SCHEMA = {
         "vote": {"enum": ["ACCEPT", "REJECT", "ABSTAIN"]},
         "vote_id": {"type": "string"},
         "new_proposal": {"type": "string"},
+        # яйцо в оппонента: "" — не бросать, иначе — за что (крайнее несогласие)
+        "egg": {"type": "string"},
     },
 }
 
@@ -168,7 +170,8 @@ class CodexAgent(Agent):
 
 class MockAgent(Agent):
     """Поведение: agree — принимает чужое предложение со 2-го раунда; stubborn — никогда;
-    flaky — первый ответ мусорный; slow — ждёт delay секунд."""
+    hothead — как stubborn, но с раунда 1 каждый раз бросает яйцо; flaky — первый ответ мусорный;
+    slow — ждёт delay секунд."""
 
     def __init__(self, name, behavior="agree", delay=0.0, color="cyan"):
         self.name, self.behavior, self.delay, self.color = name, behavior, delay, color
@@ -189,7 +192,7 @@ class MockAgent(Agent):
         mine = [c for c in cands if c["author"] == self.name]
         reply = {"position": f"{self.name}: позиция в раунде {ctx['round']}",
                  "critique": "", "questions": [], "vote": "ABSTAIN",
-                 "vote_id": "", "new_proposal": ""}
+                 "vote_id": "", "new_proposal": "", "egg": ""}
         if ctx["round"] == 0:
             reply["new_proposal"] = f"Решение от {self.name}"
         elif self.behavior in ("agree", "flaky", "slow") and theirs:
@@ -197,6 +200,8 @@ class MockAgent(Agent):
         elif mine:
             reply.update(vote="ACCEPT", vote_id=mine[0]["id"],
                          questions=["Почему вы не принимаете мой вариант?"])
+        if self.behavior == "hothead" and ctx["round"] > 0:
+            reply["egg"] = "за игнорирование моих аргументов"
         return "Вот мой ответ:\n```json\n" + json.dumps(reply, ensure_ascii=False) + "\n```"
 
 

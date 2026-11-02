@@ -30,7 +30,8 @@
    (`Debate._snapshot`) и одинаково для обоих; вызовы параллельны; ответы добавляются в протокол только после
    завершения *обоих*. Изменения председателя во время раунда попадают в следующий снимок.
 3. **Консенсус = один id.** Кандидаты неизменяемы, `id = sha256(text)[:8]`. Консенсус — только если оба в одном
-   раунде (≥ 1) проголосовали `ACCEPT` за один и тот же id, уже существовавший до этого раунда.
+   раунде (≥ 1) проголосовали `ACCEPT` за один и тот же id, уже существовавший до этого раунда,
+   и в этом раунде не летело ни одного яйца (см. ниже).
 4. **Сбой ≠ согласие.** Невалидный JSON → один повтор с текстом ошибки; повторный сбой → голос `REJECT`.
 5. **Только чтение.** Агенты не изменяют файлы: Codex `--sandbox read-only`, Claude
    `--disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch`.
@@ -40,6 +41,12 @@
    для `/continue` после перезапуска. Каждое событие `round` открывает **попытку** раунда; принимается только
    попытка с ответами обоих участников и ожидаемым номером раунда. Оборванные попытки (авария между двумя
    записями, `/stop` посреди раунда) остаются только в архивном протоколе и переигрываются.
+
+8. **Яйца (отсылка к Верховной Раде).** Поле `egg` — крайнее несогласие с оппонентом. Запас — `EGGS_PER_DEBATE`
+   (3) на участника на обсуждение и считается **по протоколу** (`Debate.eggs_left`), поэтому переживает
+   `/stop` и перезапуск. Яйцо в раунде 0 или сверх запаса не засчитывается (предупреждение). Яйцо может
+   только **помешать** консенсусу, но никогда не создаёт его. Запас виден обоим в снимке (`eggs_left`).
+   Протоколы без поля `egg` читаются как «яиц не было».
 
 Сопутствующие правила: один экземпляр `Session` на id (`Store` кэширует), `Session.set` — чтение-изменение-запись
 под замком; повторный запуск того же `Debate` (`/continue` после `/stop`) сбрасывает `cancel` до старта потока.
@@ -55,6 +62,7 @@
 | 5 Только чтение | `test_claude_is_read_only_and_uses_stdin`, `test_codex_is_read_only_and_uses_stdin` (флаги) | фактическое соблюдение ограничений самими CLI не проверяется; у Claude это запрет инструментов, не песочница ОС |
 | 6 Без shell, stdin | `test_no_shell_true` (AST), `test_run_cli_passes_long_prompt_via_stdin`, таймаут/отмена | запуск настоящих `.cmd`-обёрток — только вручную |
 | 7 Восстановление | `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
+| 8 Яйца | `test_egg_blocks_consensus_in_its_round`, `test_no_eggs_in_blind_round`, `test_eggs_run_out_and_consensus_follows`, `test_snapshot_shows_same_egg_stock_to_both`, `test_resume_keeps_egg_stock_and_reads_old_protocols`, `test_eggs_shown_in_feed_and_export` | соразмерно ли настоящие модели используют яйца — только живым прогоном |
 | meta / Session | `test_meta_updates_from_stale_instance_do_not_revert`, `test_store_returns_one_instance_per_id`, `test_rename_after_debate_keeps_status` | — |
 
 Регрессионные тесты проверены: при откате соответствующих исправлений они падают.
@@ -76,12 +84,12 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 30 passed (на момент 2026-11-02)
+python -m pytest -q tests          # должно быть: 36 passed (на момент 2026-11-02)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
 
-`--mock stubborn,agree` задаёт поведение фиктивных агентов: `agree`, `stubborn`, `flaky` (первый ответ битый), `slow`.
+`--mock stubborn,agree` задаёт поведение фиктивных агентов: `agree`, `stubborn`, `hothead` (бросает яйцо каждый раунд), `flaky` (первый ответ битый), `slow`.
 Тесты не должны вызывать настоящие CLI.
 
 CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (Python 3.12) при каждом PR и push в `main`.
@@ -131,3 +139,6 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
   Восстановление переведено на попытки, разделённые уже записываемыми событиями `round`; новый тип события не нужен.
 - 2026-11-02 — CI только на Windows (`windows-latest`): целевая платформа проекта, там же проверяются stdin-вызовы и
   `CREATE_NO_WINDOW`. Настоящие CLI в CI не запускаются.
+- 2026-11-02 — Яйца по мотивам Верховной Рады (идея председателя): отдельное поле `egg`, а не новый голос,
+  чтобы не менять семантику `vote`. Яйцо только срывает консенсус раунда (сохраняет инвариант «сбой ≠ согласие»);
+  запас ограничен, чтобы яйцо оставалось крайней мерой, а не способом бесконечно блокировать решение.

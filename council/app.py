@@ -16,7 +16,7 @@ from textual.widgets import (Button, DirectoryTree, Footer, Input, Label, ListIt
                              ListView, Markdown, Static)
 
 from .agents import build_agents
-from .engine import Debate
+from .engine import EGGS_PER_DEBATE, Debate
 from .store import Session, Store
 
 BASE = Path(__file__).resolve().parent.parent
@@ -32,7 +32,7 @@ DEFAULT_CONFIG = {
 
 STATUS_ICON = {"idle": "·", "running": "⏳", "consensus": "✅", "no_consensus": "⚖️", "stopped": "⏹"}
 
-HELP = """\
+HELP = f"""\
 **Ввод текста** — вопрос совету (или реплика председателя, если обсуждение уже идёт).
 **Перетащите файл/папку** в окно терминала — путь вставится, Enter прикрепит его.
 
@@ -48,6 +48,9 @@ HELP = """\
 - `/open` — открыть папку заседания
 - `/delete confirm` — удалить заседание
 
+🥚 Как в Верховной Раде: у каждого ИИ на обсуждение {EGGS_PER_DEBATE} яйца. Яйцо — знак крайнего несогласия
+и срывает голосование: в раунде, где оно летело, консенсус не засчитывается.
+
 Ctrl+PgUp / Ctrl+PgDn — переключение заседаний, Ctrl+Q — выход."""
 
 
@@ -57,6 +60,14 @@ def load_config() -> dict:
         path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
     cfg = {**DEFAULT_CONFIG, **json.loads(path.read_text(encoding="utf-8"))}
     return cfg
+
+
+def egg_score(verdict: dict) -> str:
+    """Счёт брошенных яиц для вердикта; пусто, если обошлось без яиц (или протокол старый)."""
+    eggs = verdict.get("eggs") or {}
+    if not any(eggs.values()):
+        return ""
+    return "🥚 Брошено яиц: " + ", ".join(f"{n} — {k}" for n, k in eggs.items())
 
 
 def parse_paths(text: str) -> list[Path] | None:
@@ -292,6 +303,9 @@ class CouncilApp(App):
             vote = {"ACCEPT": f"✅ принимает `{e['vote_id']}`", "REJECT": "❌ отклоняет",
                     "ABSTAIN": "— воздерживается"}[e["vote"]]
             md = [f"**{e['agent']}** · раунд {e['round']} · {vote}"]
+            if e.get("egg"):
+                target = next((n for n, _ in self._agents_info() if n != e["agent"]), "оппонента")
+                md.append(f"> 🥚💥 **{e['agent']} бросает яйцо в {target}!** За что: {e['egg']}")
             if not e.get("ok", True):
                 md.append("> ⚠️ ответ не получен")
             if e["position"]:
@@ -311,15 +325,18 @@ class CouncilApp(App):
         if k == "system":
             return Static(escape(e["text"]), classes="sys")
         if k == "verdict":
+            eggs = egg_score(e)
             if e["consensus"]:
                 return Markdown(f"### ✅ Консенсус за {e['rounds']} р. — вариант `{e['id']}`\n\n"
-                                + e["answer"], classes="verdict-ok")
+                                + e["answer"] + (f"\n\n{eggs}" if eggs else ""), classes="verdict-ok")
             if e.get("stopped"):
                 return Markdown("### ⏹ Обсуждение остановлено", classes="verdict-no")
             parts = [f"### ⚖️ Консенсус не достигнут (раундов: {e['rounds']})",
                      "`/continue N` — продолжить спор. Последние позиции:"]
             for name, pos in e.get("last_positions", {}).items():
                 parts.append(f"**{name}:** {pos}")
+            if eggs:
+                parts.append(eggs)
             return Markdown("\n\n".join(parts), classes="verdict-no")
         if k == "file":
             return Static(f"📎 прикреплено: {escape(e['text'])}", classes="sys")
@@ -551,6 +568,8 @@ class CouncilApp(App):
                 lines += [f"### {e['text']}", ""]
             elif k == "reply":
                 lines += [f"**{e['agent']}** — голос: {e['vote']} {e['vote_id']}", "", e["position"], ""]
+                if e.get("egg"):
+                    lines += [f"🥚 *Бросает яйцо:* {e['egg']}", ""]
                 if e["critique"]:
                     lines += ["*Критика:* " + e["critique"], ""]
                 lines += [f"- ❓ {q}" for q in e["questions"]] + [""]
@@ -559,6 +578,8 @@ class CouncilApp(App):
             elif k == "verdict":
                 lines += ["## " + ("✅ Консенсус" if e["consensus"] else "⚖️ Без консенсуса"), "",
                           e.get("answer", ""), ""]
+                if egg_score(e):
+                    lines += [egg_score(e), ""]
         path = s.root / "protocol.md"
         path.write_text("\n".join(lines), encoding="utf-8")
         return path
@@ -567,7 +588,8 @@ class CouncilApp(App):
 def main():
     ap = argparse.ArgumentParser(description="Совет ИИ: дебаты Claude и Codex")
     ap.add_argument("--mock", nargs="?", const="stubborn,agree",
-                    help="фиктивные агенты, напр. --mock stubborn,agree (для проверки без затрат)")
+                    help="фиктивные агенты, напр. --mock stubborn,agree или hothead,agree "
+                         "(для проверки без затрат)")
     args = ap.parse_args()
     CouncilApp(mock=args.mock).run()
 
