@@ -58,16 +58,37 @@ class Debate:
             return None
         tail = events[starts[-1]:]
         d = cls(agents, session, tail[0]["text"], emit, **kw)
+        names = {a.name for a in agents}
+        # Каждое событие "round" открывает попытку раунда. Принимается только попытка, где
+        # записаны ответы обоих участников; оборванные попытки (авария между двумя записями,
+        # /stop посреди раунда) остаются лишь в архивном протоколе и переигрываются.
+        attempts: list[dict] = []
         for e in tail:
-            if e.get("kind") == "reply":
-                d.log.append({k: e[k] for k in ("round", "agent", "position", "critique",
-                                                 "questions", "vote", "vote_id", "proposed")})
-                if e.get("proposed") and e["proposed"] not in {c["id"] for c in d.candidates}:
-                    d.candidates.append({"id": e["proposed"], "author": e["agent"],
-                                         "round": e["round"], "text": e["proposal_text"]})
-                d.round = e["round"] + 1
-            elif e.get("kind") == "chair":
-                d.notes.append({"round": d.round, "text": e["text"]})
+            kind = e.get("kind")
+            if kind == "round":
+                attempts.append({"round": e["round"], "replies": {}, "notes": []})
+            elif kind == "reply" and attempts and e["round"] == attempts[-1]["round"]:
+                attempts[-1]["replies"].setdefault(e["agent"], e)
+            elif kind == "chair":
+                if attempts:
+                    attempts[-1]["notes"].append(e["text"])
+                else:
+                    d.notes.append({"round": 0, "text": e["text"]})
+        next_round = 0
+        for att in attempts:
+            complete = names <= att["replies"].keys() and att["round"] == next_round
+            if complete:
+                for name in (a.name for a in agents):
+                    e = att["replies"][name]
+                    d.log.append({k: e[k] for k in ("round", "agent", "position", "critique",
+                                                     "questions", "vote", "vote_id", "proposed")})
+                    if e.get("proposed") and e["proposed"] not in {c["id"] for c in d.candidates}:
+                        d.candidates.append({"id": e["proposed"], "author": e["agent"],
+                                             "round": e["round"], "text": e["proposal_text"]})
+                next_round += 1
+            # реплика председателя, сделанная во время попытки, учитывается со следующего раунда
+            d.notes.extend({"round": next_round, "text": t} for t in att["notes"])
+        d.round = next_round
         return d
 
     # --- контекст ---
@@ -92,28 +113,33 @@ class Debate:
                             "critique": entry["critique"][:400]})
         return out
 
-    def _prompt(self, me: Agent, other: Agent) -> str:
+    def _snapshot(self) -> tuple[dict, list[Path]]:
+        """Общее состояние раунда: читается с диска один раз и одинаково для обоих участников.
+        Изменения председателя (тема, вложения) попадут только в следующий снимок."""
         files = self.session.files()
-        state = {
-            "you": me.name, "opponent": other.name, "round": self.round,
-            "max_rounds": self.max_rounds,
+        shared = {
+            "round": self.round, "max_rounds": self.max_rounds,
             "session_title": self.session.title, "session_topic": self.session.topic,
             "question": self.question,
             "files": [f"files/{f}" for f in files],
             "prior_decisions_in_session": self._prior_decisions(),
-            "chair_notes": self.notes,
+            "chair_notes": list(self.notes),
             "debate_log": self._compact_log(),
-            "candidates": self.candidates,
+            "candidates": list(self.candidates),
         }
+        attachments = [Path(self.session.files_dir) / f.rstrip("/") for f in files]
+        return json.loads(json.dumps(shared, ensure_ascii=False)), attachments
+
+    def _prompt(self, me: Agent, other: Agent, shared: dict) -> str:
+        state = {"you": me.name, "opponent": other.name, **shared}
         intro = RULES.format(me=me.name, other=other.name)
-        if files:
+        if shared["files"]:
             intro += "\n\nФайлы заседания лежат в рабочей папке в каталоге files/."
         return (intro + "\n\nСостояние заседания (JSON) после метки:\n<<STATE>>"
                 + json.dumps(state, ensure_ascii=False, indent=1))
 
     # --- вызов с проверкой схемы ---
-    def _ask(self, agent: Agent, prompt: str) -> dict:
-        attachments = [Path(self.session.files_dir) / f.rstrip("/") for f in self.session.files()]
+    def _ask(self, agent: Agent, prompt: str, attachments: list[Path]) -> dict:
         last_err = ""
         for attempt in range(2):
             p = prompt if not last_err else (
@@ -154,9 +180,11 @@ class Debate:
                 self.emit({"kind": "round", "round": self.round,
                            "text": "Независимый анализ" if self.round == 0 else f"Раунд {self.round}"})
                 # один снимок состояния для обоих, вызовы параллельно
-                prompts = {a.name: self._prompt(a, b), b.name: self._prompt(b, a)}
+                shared, attachments = self._snapshot()
+                prompts = {a.name: self._prompt(a, b, shared), b.name: self._prompt(b, a, shared)}
                 with ThreadPoolExecutor(2) as ex:
-                    futs = {ag.name: ex.submit(self._ask, ag, prompts[ag.name]) for ag in self.agents}
+                    futs = {ag.name: ex.submit(self._ask, ag, prompts[ag.name], attachments)
+                            for ag in self.agents}
                     replies = {n: f.result() for n, f in futs.items()}
                 if self.cancel.is_set():
                     raise Cancelled()

@@ -26,15 +26,17 @@ class Session:
     def topic(self) -> str:
         return self.meta.get("topic", "")
 
-    def save_meta(self):
-        with self._lock:
-            tmp = self.root / "meta.json.tmp"
-            tmp.write_text(json.dumps(self.meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self.root / "meta.json")
-
     def set(self, **fields):
-        self.meta.update(fields)
-        self.save_meta()
+        """Чтение-изменение-запись под замком: меняются только переданные поля, остальные
+        берутся с диска, поэтому устаревшая копия meta не затрёт чужие изменения."""
+        with self._lock:
+            path = self.root / "meta.json"
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            meta.update(fields)
+            tmp = self.root / "meta.json.tmp"
+            tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+            self.meta = meta
 
     # --- события (протокол заседания) ---
     def append(self, event: dict) -> dict:
@@ -92,12 +94,23 @@ class Session:
 
 
 class Store:
+    """Один экземпляр Session на id: интерфейс и рабочие потоки работают с одним объектом и одним замком."""
+
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._sessions: dict[str, Session] = {}
+        self._lock = threading.Lock()
+
+    def _get(self, root: Path) -> Session:
+        with self._lock:
+            s = self._sessions.get(root.name)
+            if s is None:
+                s = self._sessions[root.name] = Session(root)
+            return s
 
     def list(self) -> list[Session]:
-        sessions = [Session(p) for p in self.root.iterdir() if (p / "meta.json").exists()]
+        sessions = [self._get(p) for p in self.root.iterdir() if (p / "meta.json").exists()]
         return sorted(sessions, key=lambda s: s.meta.get("created", 0), reverse=True)
 
     def create(self, title: str, topic: str = "") -> Session:
@@ -107,7 +120,9 @@ class Store:
         meta = {"id": sid, "title": title, "topic": topic,
                 "created": time.time(), "status": "idle"}
         (root / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        return Session(root)
+        return self._get(root)
 
     def delete(self, session: Session):
+        with self._lock:
+            self._sessions.pop(session.id, None)
         shutil.rmtree(session.root)

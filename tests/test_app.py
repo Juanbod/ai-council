@@ -31,7 +31,7 @@ async def wait_idle(pilot, sid, timeout=5):
 @pytest.mark.asyncio
 async def test_full_flow(app, tmp_path):
     f = tmp_path / "doc.txt"
-    f.write_text("данные")
+    f.write_text("данные", encoding="utf-8")
     async with app.run_test(size=(140, 45)) as pilot:
         await type_and_send(pilot, "/new Архитектура | выбор БД")
         s1 = app.current
@@ -75,6 +75,43 @@ async def test_chair_note_and_stop(app, monkeypatch):
         await wait_idle(pilot, s.id)
         await pilot.pause()
         assert s.meta["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_continue_after_stop_runs_again(app, monkeypatch):
+    """Регрессия: /continue после /stop без перезапуска приложения сразу останавливался."""
+    slow = {"delay": 0.4}
+    monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [
+        MockAgent("Claude", "stubborn", **slow), MockAgent("Codex", "agree", **slow)])
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Стоп-старт")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await pilot.press("ctrl+s")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert s.meta["status"] == "stopped"
+
+        slow["delay"] = 0
+        await type_and_send(pilot, "/continue 3")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        verdict = [e for e in s.events() if e["kind"] == "verdict"][-1]
+        assert not verdict["stopped"] and verdict["consensus"]
+        assert s.meta["status"] == "consensus"
+
+
+@pytest.mark.asyncio
+async def test_rename_after_debate_keeps_status(app):
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Имя")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        await type_and_send(pilot, "/rename Другое имя")
+        meta = app_mod.Session(s.root).meta  # перечитано с диска
+        assert meta["status"] == "consensus" and meta["title"] == "Другое имя"
 
 
 def test_parse_paths(tmp_path):
