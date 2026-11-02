@@ -37,7 +37,9 @@
 6. **Без `shell=True`.** Исполняемые файлы находятся через `shutil.which`; промпт передаётся через **stdin**
    (обход лимита длины командной строки Windows ~32К).
 7. **Протокол append-only.** `events.jsonl` только дописывается; `Debate.from_events` восстанавливает обсуждение
-   для `/continue` после перезапуска, учитывая **только завершённые пары** ответов (оборванный раунд переигрывается).
+   для `/continue` после перезапуска. Каждое событие `round` открывает **попытку** раунда; принимается только
+   попытка с ответами обоих участников и ожидаемым номером раунда. Оборванные попытки (авария между двумя
+   записями, `/stop` посреди раунда) остаются только в архивном протоколе и переигрываются.
 
 Сопутствующие правила: один экземпляр `Session` на id (`Store` кэширует), `Session.set` — чтение-изменение-запись
 под замком; повторный запуск того же `Debate` (`/continue` после `/stop`) сбрасывает `cancel` до старта потока.
@@ -52,7 +54,7 @@
 | 4 Сбой ≠ согласие | `test_flaky_agent_is_retried`, `test_two_failures_count_as_reject` | — |
 | 5 Только чтение | `test_claude_is_read_only_and_uses_stdin`, `test_codex_is_read_only_and_uses_stdin` (флаги) | фактическое соблюдение ограничений самими CLI не проверяется; у Claude это запрет инструментов, не песочница ОС |
 | 6 Без shell, stdin | `test_no_shell_true` (AST), `test_run_cli_passes_long_prompt_via_stdin`, таймаут/отмена | запуск настоящих `.cmd`-обёрток — только вручную |
-| 7 Восстановление | `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_continue_after_stop_runs_again` | — |
+| 7 Восстановление | `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
 | meta / Session | `test_meta_updates_from_stale_instance_do_not_revert`, `test_store_returns_one_instance_per_id`, `test_rename_after_debate_keeps_status` | — |
 
 Регрессионные тесты проверены: при откате соответствующих исправлений они падают.
@@ -74,7 +76,7 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 28 passed (на момент 2026-11-02)
+python -m pytest -q tests          # должно быть: 30 passed (на момент 2026-11-02)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
@@ -123,3 +125,5 @@ python -m pytest -q tests          # должно быть: 28 passed (на мо
 - 2026-11-02 — По ревью Codex (ветка `claude/review-fixes`): сброс отмены перед `/continue` (в приложении, а не
   в `run()`, чтобы ранний `/stop` не терялся); единый снимок раунда; один `Session` на id + RMW-запись meta;
   восстановление только по завершённым парам — без нового типа события, чтобы старые протоколы читались так же.
+- 2026-11-02 — Повторное ревью Codex PR #1: группировка по номеру раунда смешивала попытки после переигрывания.
+  Восстановление переведено на попытки, разделённые уже записываемыми событиями `round`; новый тип события не нужен.

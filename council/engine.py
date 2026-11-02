@@ -59,28 +59,36 @@ class Debate:
         tail = events[starts[-1]:]
         d = cls(agents, session, tail[0]["text"], emit, **kw)
         names = {a.name for a in agents}
-        replies = [e for e in tail if e.get("kind") == "reply"]
-        # учитываются только раунды, где записаны ответы обоих участников; оборванная пара
-        # (сбой между двумя записями) отбрасывается целиком и будет переигран
-        by_round: dict[int, set[str]] = {}
-        for e in replies:
-            by_round.setdefault(e["round"], set()).add(e["agent"])
-        complete = {r for r, who in by_round.items() if names <= who}
-        for e in replies:
-            if e["round"] not in complete:
-                continue
-            d.log.append({k: e[k] for k in ("round", "agent", "position", "critique",
-                                             "questions", "vote", "vote_id", "proposed")})
-            if e.get("proposed") and e["proposed"] not in {c["id"] for c in d.candidates}:
-                d.candidates.append({"id": e["proposed"], "author": e["agent"],
-                                     "round": e["round"], "text": e["proposal_text"]})
-        d.round = max(complete) + 1 if complete else 0
-        next_round = 0
+        # Каждое событие "round" открывает попытку раунда. Принимается только попытка, где
+        # записаны ответы обоих участников; оборванные попытки (авария между двумя записями,
+        # /stop посреди раунда) остаются лишь в архивном протоколе и переигрываются.
+        attempts: list[dict] = []
         for e in tail:
-            if e.get("kind") == "reply" and e["round"] in complete:
-                next_round = e["round"] + 1
-            elif e.get("kind") == "chair":
-                d.notes.append({"round": next_round, "text": e["text"]})
+            kind = e.get("kind")
+            if kind == "round":
+                attempts.append({"round": e["round"], "replies": {}, "notes": []})
+            elif kind == "reply" and attempts and e["round"] == attempts[-1]["round"]:
+                attempts[-1]["replies"].setdefault(e["agent"], e)
+            elif kind == "chair":
+                if attempts:
+                    attempts[-1]["notes"].append(e["text"])
+                else:
+                    d.notes.append({"round": 0, "text": e["text"]})
+        next_round = 0
+        for att in attempts:
+            complete = names <= att["replies"].keys() and att["round"] == next_round
+            if complete:
+                for name in (a.name for a in agents):
+                    e = att["replies"][name]
+                    d.log.append({k: e[k] for k in ("round", "agent", "position", "critique",
+                                                     "questions", "vote", "vote_id", "proposed")})
+                    if e.get("proposed") and e["proposed"] not in {c["id"] for c in d.candidates}:
+                        d.candidates.append({"id": e["proposed"], "author": e["agent"],
+                                             "round": e["round"], "text": e["proposal_text"]})
+                next_round += 1
+            # реплика председателя, сделанная во время попытки, учитывается со следующего раунда
+            d.notes.extend({"round": next_round, "text": t} for t in att["notes"])
+        d.round = next_round
         return d
 
     # --- контекст ---

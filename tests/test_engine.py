@@ -181,17 +181,50 @@ def test_two_failures_count_as_reject(session):
     assert sum(e["kind"] == "warning" for e in events) == 2 * len(replies)
 
 
+def crash_after_one_reply(session, rnd):
+    """Имитация аварии: раунд начат, но успел записаться только ответ Claude."""
+    session.append({"kind": "round", "round": rnd, "text": f"Раунд {rnd}"})
+    session.append({"kind": "reply", "ok": True, "round": rnd, "agent": "Claude", "position": "p",
+                    "critique": "", "questions": [], "vote": "REJECT", "vote_id": "",
+                    "proposed": "deadbeef", "proposal_text": "из оборванного раунда"})
+
+
 def test_resume_drops_half_written_round(session):
     """Аварийный выход между двумя записями пары: оборванный раунд переигрывается целиком."""
     run(session, MockAgent("Claude", "stubborn"), MockAgent("Codex", "stubborn"), rounds=1)
-    session.append({"kind": "reply", "ok": True, "round": 2, "agent": "Claude", "position": "p",
-                    "critique": "", "questions": [], "vote": "REJECT", "vote_id": "",
-                    "proposed": "deadbeef", "proposal_text": "из оборванного раунда"})
+    crash_after_one_reply(session, 2)
     d2 = Debate.from_events([MockAgent("Claude", "stubborn"), MockAgent("Codex", "agree")],
                             session, session.append)
     assert d2.round == 2
     assert all(e["round"] < 2 for e in d2.log)
     assert "deadbeef" not in {c["id"] for c in d2.candidates}
+
+
+def test_resume_twice_after_replayed_round(session):
+    """Регрессия (ревью Codex к PR #1): авария → восстановление → переигрывание раунда →
+    повторное восстановление. Ответы отброшенной попытки не должны вернуться."""
+    session.append({"kind": "question", "text": "вопрос?"})
+    crash_after_one_reply(session, 0)
+
+    stubborn = [MockAgent("Claude", "stubborn"), MockAgent("Codex", "stubborn")]
+    d1 = Debate.from_events(stubborn, session, session.append)
+    assert d1.round == 0 and d1.log == [] and d1.candidates == []
+    d1.run(start_round=0, extra_rounds=1)  # переигрываем раунд 0 целиком
+
+    d2 = Debate.from_events(stubborn, session, session.append)
+    round0 = [e for e in d2.log if e["round"] == 0]
+    assert sorted(e["agent"] for e in round0) == ["Claude", "Codex"]
+    assert "deadbeef" not in {c["id"] for c in d2.candidates}
+    assert d2.round == 1
+
+
+def test_resume_ignores_stopped_attempt(session):
+    """/stop посреди раунда: событие round записано, ответов нет — раунд переигрывается."""
+    session.append({"kind": "question", "text": "q"})
+    session.append({"kind": "round", "round": 0, "text": "Независимый анализ"})
+    session.append({"kind": "system", "text": "Обсуждение остановлено председателем."})
+    d = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], session, session.append)
+    assert d.round == 0 and d.log == []
 
 
 def test_meta_updates_from_stale_instance_do_not_revert(tmp_path):
