@@ -31,7 +31,7 @@ async def wait_idle(pilot, sid, timeout=5):
 @pytest.mark.asyncio
 async def test_full_flow(app, tmp_path):
     f = tmp_path / "doc.txt"
-    f.write_text("данные")
+    f.write_text("данные", encoding="utf-8")
     async with app.run_test(size=(140, 45)) as pilot:
         await type_and_send(pilot, "/new Архитектура | выбор БД")
         s1 = app.current
