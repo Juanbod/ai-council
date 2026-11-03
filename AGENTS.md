@@ -48,6 +48,12 @@
    только **помешать** консенсусу, но никогда не создаёт его. Запас виден обоим в снимке (`eggs_left`).
    Протоколы без поля `egg` читаются как «яиц не было».
 
+Расход и лимиты: каждый ответ в `events.jsonl` несёт `usage` (токены вход/выход, $, время, число вызовов, включая
+неудачные попытки). В `Debate.log` и снимок расход **не попадает** — участники его не видят. Лимиты проверяются
+`budget_check` перед каждым раундом; исчерпанный лимит приостанавливает обсуждение (как `/stop`).
+Взятка председателя (`/взятка`, событие `bribe`) прибавляется к ненулевому лимиту из `config.json` до конца дня
+(`Store.bribes_today`); к участникам не попадает, на протокол дебатов не влияет.
+
 Сопутствующие правила: один экземпляр `Session` на id (`Store` кэширует), `Session.set` — чтение-изменение-запись
 под замком; повторный запуск того же `Debate` (`/continue` после `/stop`) сбрасывает `cancel` до старта потока.
 
@@ -63,6 +69,8 @@
 | 6 Без shell, stdin | `test_no_shell_true` (AST), `test_run_cli_passes_long_prompt_via_stdin`, таймаут/отмена | запуск настоящих `.cmd`-обёрток — только вручную |
 | 7 Восстановление | `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
 | 8 Яйца | `test_egg_blocks_consensus_in_its_round`, `test_no_eggs_in_blind_round`, `test_eggs_run_out_and_consensus_follows`, `test_snapshot_shows_same_egg_stock_to_both`, `test_resume_keeps_egg_stock_and_reads_old_protocols`, `test_eggs_shown_in_feed_and_export` | соразмерно ли настоящие модели используют яйца — только живым прогоном |
+| Расход / лимиты | `test_reply_usage_counts_failed_attempts_too`, `test_budget_check_pauses_before_round`, `test_usage_totals_skips_old_and_earlier_events`, `test_codex_reports_usage_from_json_events`, `test_claude_reports_usage_and_cost`, `test_usage_indicator_and_daily_limit`, `test_parse_bribe_amount`, `test_bribes_count_only_today`, `test_bribe_raises_limit_and_debate_continues`, `test_old_config_gets_limits_section` | остаток лимитов подписки недоступен из CLI |
+| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs` | как анимация выглядит в разных терминалах — вручную |
 | meta / Session | `test_meta_updates_from_stale_instance_do_not_revert`, `test_store_returns_one_instance_per_id`, `test_rename_after_debate_keeps_status` | — |
 
 Регрессионные тесты проверены: при откате соответствующих исправлений они падают.
@@ -77,14 +85,19 @@
   `additionalProperties: false`.
 - **Claude Code CLI 2.1.316** (npm `@anthropic-ai/claude-code`), вход через `claude auth login`:
   `-p --output-format json` возвращает объект с `result`, при `--json-schema` — ещё и `structured_output`.
-  `--disallowedTools`, `--model` есть.
+  `--disallowedTools`, `--model` есть. В JSON есть `usage` (вход, `cache_creation_input_tokens`,
+  `cache_read_input_tokens`, выход) и `total_cost_usd` (цена по прейскуранту API). Даже пустой вызов стоит
+  ~30К входных токенов — это системный промпт Claude Code.
+- `codex exec --json` печатает JSONL; расход — в событии `turn.completed` (`usage.input_tokens`, `output_tokens`),
+  совместим с `--output-schema` и `-o` (проверено 2026-11-03). Стоимости и остатка лимитов в выводе нет.
+- Ни один CLI не сообщает остаток лимитов подписки неинтерактивно (только `/usage`/`/status` в их TUI).
 - Живой тест: полный спор по `dedupe.py` дошёл до консенсуса за 1 раунд (~35 с).
 
 ## Как запускать и проверять
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 36 passed (на момент 2026-11-02)
+python -m pytest -q tests          # должно быть: 48 passed (на момент 2026-11-03)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
@@ -118,7 +131,9 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - **Рост контекста**: раунды старше двух последних сжимаются обрезкой (`_compact_log`), а не настоящим резюме.
 - **Нет прогресса внутри вызова**: пока агент думает (десятки секунд), лента не обновляется; можно перейти на
   `--output-format stream-json` / `codex exec --json`.
-- **Нет учёта стоимости/токенов** и времени по раундам.
+- **Остаток лимитов подписки** неизвестен: учитывается только расход приложения (`/usage`, `limits`).
+- **Накладные расходы Claude**: ~30К токенов системного промпта на каждый вызов. Можно попробовать
+  урезанный системный промпт или повторное использование сессии — нужно проверить, что не ломается изоляция.
 - Поле `rounds` в вердикте без консенсуса равно `max_rounds + 1` (номер следующего раунда) — стоит уточнить семантику.
 - `CouncilApp._agents_info` пересоздаёт агентов при каждой отрисовке реплики — мелкая неэффективность.
 - Изображения передаются явно только Codex (`-i`); Claude читает их сам инструментом Read.
@@ -142,3 +157,10 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - 2026-11-02 — Яйца по мотивам Верховной Рады (идея председателя): отдельное поле `egg`, а не новый голос,
   чтобы не менять семантику `vote`. Яйцо только срывает консенсус раунда (сохраняет инвариант «сбой ≠ согласие»);
   запас ограничен, чтобы яйцо оставалось крайней мерой, а не способом бесконечно блокировать решение.
+- 2026-11-03 — Индикатор расхода (запрос председателя): CLI не отдают остаток подписки, поэтому считаем расход
+  самого приложения из `usage` в протоколе и сравниваем с дневными лимитами из `config.json`. Проверка перед
+  раундом, а не посреди: раунд не обрывается на одном участнике, симметрия сохраняется.
+- 2026-11-03 — Анимация яйца только для живых событий: при повторном открытии заседания история статична.
+- 2026-11-03 — «Взятка» (идея председателя) поднимает дневной лимит только до полуночи и хранится событием в
+  протоколе, а не правкой `config.json`: постоянный лимит остаётся осознанной настройкой, а разовые прибавки видны
+  в истории. Взятка к безлимитному участнику не принимается — она ничего бы не изменила.

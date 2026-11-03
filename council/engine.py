@@ -3,6 +3,7 @@ import hashlib
 import json
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -45,10 +46,13 @@ class Debate:
     """Одно обсуждение вопроса председателя. emit(event) вызывается из рабочего потока."""
 
     def __init__(self, agents: list[Agent], session, question: str, emit,
-                 max_rounds: int = 5, history_full_rounds: int = 2, eggs: int = EGGS_PER_DEBATE):
+                 max_rounds: int = 5, history_full_rounds: int = 2, eggs: int = EGGS_PER_DEBATE,
+                 budget_check=None):
         assert len(agents) == 2, "протокол рассчитан на двух участников"
         self.agents, self.session, self.question = agents, session, question
         self.emit, self.max_rounds, self.eggs = emit, max_rounds, eggs
+        # budget_check() -> str | None: причина не начинать раунд (исчерпан лимит участника)
+        self.budget_check = budget_check
         self.history_full_rounds = history_full_rounds
         self.cancel = threading.Event()
         self.chair_notes: queue.Queue[str] = queue.Queue()
@@ -156,27 +160,42 @@ class Debate:
 
     # --- вызов с проверкой схемы ---
     def _ask(self, agent: Agent, prompt: str, attachments: list[Path]) -> dict:
+        """Ответ участника с полем usage — суммарный расход всех попыток, включая неудачные."""
+        spent = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "seconds": 0.0, "calls": 0}
+
+        def account(t0):
+            u = agent.last_usage or {}
+            for k in ("tokens_in", "tokens_out", "cost_usd"):
+                spent[k] += u.get(k, 0)
+            spent["seconds"] += time.monotonic() - t0
+            spent["calls"] += 1
+
         last_err = ""
         for attempt in range(2):
             p = prompt if not last_err else (
                 prompt + f"\n\nТвой предыдущий ответ отклонён модератором: {last_err}\n"
                          "Верни ТОЛЬКО один JSON-объект по схеме.")
+            t0 = time.monotonic()
+            agent.last_usage = None
             try:
                 raw = agent.ask(p, self.session.root, attachments, self.cancel)
+                account(t0)
                 if not raw or not raw.strip():
                     raise ValueError("пустой ответ")
                 data = extract_json(raw)
                 validate(data, SCHEMA)
-                return {"ok": True, **data}
+                return {"ok": True, **data, "usage": spent}
             except Cancelled:
                 raise
             except (AgentError, ValueError, ValidationError, OSError) as e:
+                if spent["calls"] == attempt:  # сам вызов упал — время всё равно потрачено
+                    account(t0)
                 last_err = (e.message if isinstance(e, ValidationError) else str(e))[:500]
                 self.emit({"kind": "warning", "agent": agent.name,
                            "text": f"попытка {attempt + 1}: {last_err}"})
         # сбой участника = несогласие, а не молчаливое ACCEPT
         return {"ok": False, "position": "", "critique": f"[сбой: {last_err}]", "questions": [],
-                "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": ""}
+                "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": "", "usage": spent}
 
     def add_chair_note(self, text: str):
         self.chair_notes.put(text)
@@ -193,6 +212,11 @@ class Debate:
                 while not self.chair_notes.empty():
                     note = {"round": self.round, "text": self.chair_notes.get()}
                     self.notes.append(note)
+                reason = self.budget_check() if self.budget_check else None
+                if reason:
+                    self.emit({"kind": "system", "text": f"⛽ Обсуждение приостановлено: {reason}. "
+                                                         "Поднимите лимит в config.json или продолжите завтра."})
+                    return self._finish(False, "", "", stopped=True)
                 self.emit({"kind": "round", "round": self.round,
                            "text": "Независимый анализ" if self.round == 0 else f"Раунд {self.round}"})
                 # один снимок состояния для обоих, вызовы параллельно
@@ -231,8 +255,9 @@ class Debate:
                              "vote": r["vote"], "vote_id": r["vote_id"], "proposed": new_id,
                              "egg": eggs[ag.name]}
                     self.log.append(entry)
+                    # расход пишется в протокол, но не входит в log: участникам он не показывается
                     self.emit({"kind": "reply", "ok": r["ok"], **entry,
-                               "proposal_text": r["new_proposal"].strip()})
+                               "proposal_text": r["new_proposal"].strip(), "usage": r["usage"]})
 
                 if agreed_id and not consensus_id:
                     self.emit({"kind": "system", "text": "🥚 Голосование сорвано: летели яйца. "

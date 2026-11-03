@@ -100,9 +100,42 @@ def extract_json(text: str):
     raise ValueError("в ответе нет JSON-объекта")
 
 
+def usage(tokens_in=0, tokens_out=0, cost_usd=0.0) -> dict:
+    """Расход одного вызова в общем виде для обоих CLI."""
+    return {"tokens_in": int(tokens_in), "tokens_out": int(tokens_out), "cost_usd": float(cost_usd)}
+
+
+def claude_usage(data: dict) -> dict:
+    u = data.get("usage") or {}
+    return usage(u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                 + u.get("cache_read_input_tokens", 0), u.get("output_tokens", 0),
+                 data.get("total_cost_usd") or 0)
+
+
+def codex_events(out: str) -> tuple[dict | None, str]:
+    """Разбор JSONL `codex exec --json`: расход из turn.completed и текст последнего ответа."""
+    found, text = None, ""
+    for line in out.splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict):
+            u = e["usage"]
+            found = usage(u.get("input_tokens", 0), u.get("output_tokens", 0))
+        item = e.get("item") or {}
+        if e.get("type") == "item.completed" and item.get("type") == "agent_message":
+            text = item.get("text", "")
+    return found, text
+
+
 class Agent:
     name = "Agent"
     color = "white"
+    # расход последнего вызова ask() (None — CLI не сообщил); каждый агент работает в своём потоке
+    last_usage: dict | None = None
 
     def ask(self, prompt: str, workdir: Path, attachments: list[Path],
             cancel: threading.Event | None = None) -> str:
@@ -116,6 +149,7 @@ class ClaudeAgent(Agent):
         self.use_json_schema, self.extra_args, self.color = use_json_schema, extra_args or [], color
 
     def ask(self, prompt, workdir, attachments, cancel=None):
+        self.last_usage = None
         cmd = [resolve_exe(self.exe), "-p", "--output-format", "json",
                # только чтение: инструменты записи и выполнения команд запрещены
                "--disallowedTools", "Edit,Write,NotebookEdit,Bash,WebFetch"]
@@ -137,6 +171,7 @@ class ClaudeAgent(Agent):
         except json.JSONDecodeError:
             return raw
         if isinstance(data, dict):
+            self.last_usage = claude_usage(data)
             if data.get("is_error"):
                 raise AgentError(str(data.get("result") or data)[:800])
             if isinstance(data.get("structured_output"), dict):
@@ -152,11 +187,12 @@ class CodexAgent(Agent):
         self.extra_args, self.color = extra_args or [], color
 
     def ask(self, prompt, workdir, attachments, cancel=None):
+        self.last_usage = None
         with tempfile.TemporaryDirectory() as d:
             schema, last = Path(d) / "schema.json", Path(d) / "last.txt"
             schema.write_text(json.dumps(SCHEMA), encoding="utf-8")
             cmd = [resolve_exe(self.exe), "exec", "--sandbox", "read-only",
-                   "--skip-git-repo-check", "--ephemeral", "--color", "never",
+                   "--skip-git-repo-check", "--ephemeral", "--color", "never", "--json",
                    "-C", str(workdir), "--output-schema", str(schema), "-o", str(last)]
             if self.model:
                 cmd += ["-m", self.model]
@@ -165,7 +201,8 @@ class CodexAgent(Agent):
                     cmd += ["-i", str(a)]
             cmd += self.extra_args + ["-"]
             out = run_cli(cmd, prompt, workdir, self.timeout, cancel)
-            return last.read_text(encoding="utf-8") if last.exists() else out
+            self.last_usage, text = codex_events(out)
+            return last.read_text(encoding="utf-8") if last.exists() else text
 
 
 class MockAgent(Agent):
@@ -184,6 +221,7 @@ class MockAgent(Agent):
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
             time.sleep(0.05)
+        self.last_usage = usage(len(prompt) // 4, 50)  # грубая оценка: ~4 символа на токен
         if self.behavior == "flaky" and self.calls == 1:
             return "извините, вот {сломанный: json"
         ctx = json.loads(prompt.rsplit("<<STATE>>", 1)[1])

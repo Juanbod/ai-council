@@ -319,3 +319,43 @@ def test_resume_keeps_egg_stock_and_reads_old_protocols(session):
                     "proposed": "", "proposal_text": ""})
     d2 = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], old, old.append)
     assert d2.round == 1 and d2.eggs_left() == {"Claude": 3, "Codex": 3}
+
+
+# ---------- расход и лимиты ----------
+
+def test_reply_usage_counts_failed_attempts_too(session):
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([MockAgent("Claude", "stubborn"), MockAgent("Codex", "flaky")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=1)
+    d.run()
+    first = {e["agent"]: e["usage"] for e in events if e["kind"] == "reply" and e["round"] == 0}
+    assert first["Claude"]["calls"] == 1 and first["Codex"]["calls"] == 2
+    assert first["Codex"]["tokens_in"] > first["Claude"]["tokens_in"]
+    assert "usage" not in d.log[0]  # участникам расход не показывается
+
+
+def test_budget_check_pauses_before_round(session):
+    events = []
+    checks = iter([None, None, "у Claude исчерпан дневной лимит"])
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([MockAgent("Claude", "stubborn"), MockAgent("Codex", "stubborn")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=5,
+               budget_check=lambda: next(checks))
+    v = d.run()
+    assert v["stopped"] and not v["consensus"] and d.round == 2
+    assert {e["round"] for e in events if e["kind"] == "reply"} == {0, 1}
+    assert any(e["kind"] == "system" and "лимит" in e["text"] for e in events)
+
+
+def test_usage_totals_skips_old_and_earlier_events():
+    from council.store import usage_totals
+    events = [
+        {"kind": "reply", "agent": "Claude", "ts": 5, "usage": {"tokens_in": 10, "calls": 1}},
+        {"kind": "reply", "agent": "Claude", "ts": 20, "usage": {"tokens_in": 7, "cost_usd": 0.5, "calls": 1}},
+        {"kind": "reply", "agent": "Codex", "ts": 20},  # старый протокол без usage
+        {"kind": "system", "ts": 20, "usage": {"tokens_in": 99}},
+    ]
+    assert usage_totals(events)["Claude"]["tokens_in"] == 17
+    today = usage_totals(events, since=10)
+    assert today == {"Claude": {"tokens_in": 7, "tokens_out": 0, "cost_usd": 0.5, "seconds": 0, "calls": 1}}

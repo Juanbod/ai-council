@@ -72,3 +72,29 @@ def test_no_shell_true():
     shell_kwargs = [k for node in ast.walk(tree) if isinstance(node, ast.Call)
                     for k in node.keywords if k.arg == "shell"]
     assert shell_kwargs == []
+
+
+def test_codex_reports_usage_from_json_events(monkeypatch, tmp_path):
+    jsonl = "\n".join([
+        '{"type": "thread.started", "thread_id": "x"}',
+        '{"type": "item.completed", "item": {"type": "agent_message", "text": "{\\"a\\": 1}"}}',
+        '{"type": "turn.completed", "usage": {"input_tokens": 16862, "cached_input_tokens": 0, '
+        '"output_tokens": 5, "reasoning_output_tokens": 0}}'])
+    calls = []
+    monkeypatch.setattr(agents, "run_cli", lambda cmd, *a, **k: calls.append(cmd) or jsonl)
+    monkeypatch.setattr(agents, "resolve_exe", lambda name: name)
+    ag = CodexAgent()
+    assert ag.ask("p", tmp_path, []) == '{"a": 1}'  # без файла -o берём текст из событий
+    assert "--json" in calls[0]
+    assert ag.last_usage == {"tokens_in": 16862, "tokens_out": 5, "cost_usd": 0.0}
+
+
+def test_claude_reports_usage_and_cost(monkeypatch, tmp_path):
+    out = ('{"type": "result", "is_error": false, "result": "{}", "total_cost_usd": 0.25, '
+           '"usage": {"input_tokens": 2, "cache_creation_input_tokens": 30845, '
+           '"cache_read_input_tokens": 100, "output_tokens": 4}}')
+    monkeypatch.setattr(agents, "run_cli", lambda *a, **k: out)
+    monkeypatch.setattr(agents, "resolve_exe", lambda name: name)
+    ag = ClaudeAgent()
+    ag.ask("p", tmp_path, [])
+    assert ag.last_usage == {"tokens_in": 30947, "tokens_out": 4, "cost_usd": 0.25}
