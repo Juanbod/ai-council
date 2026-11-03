@@ -148,6 +148,8 @@ class Agent:
     color = "white"
     # расход последнего вызова ask() (None — CLI не сообщил); каждый агент работает в своём потоке
     last_usage: dict | None = None
+    # доступ в интернет на этот вызов; движок выставляет его из снимка раунда (/web в заседании)
+    web = False
 
     def ask(self, prompt: str, workdir: Path, attachments: list[Path],
             cancel: threading.Event | None = None) -> str:
@@ -162,9 +164,11 @@ class ClaudeAgent(Agent):
 
     def ask(self, prompt, workdir, attachments, cancel=None):
         self.last_usage = None
-        cmd = [resolve_exe(self.exe), "-p", "--output-format", "json",
-               # только чтение: инструменты записи и выполнения команд запрещены
-               "--disallowedTools", "Edit,Write,NotebookEdit,Bash,WebFetch"]
+        # только чтение: инструменты записи и выполнения команд запрещены всегда, веб — без /web
+        denied = "Edit,Write,NotebookEdit,Bash" + ("" if self.web else ",WebFetch,WebSearch")
+        cmd = [resolve_exe(self.exe), "-p", "--output-format", "json", "--disallowedTools", denied]
+        if self.web:  # в режиме -p без явного разрешения WebFetch получает отказ
+            cmd += ["--allowedTools", "WebFetch,WebSearch"]
         if self.model:
             cmd += ["--model", self.model]
         # без --add-dir Claude в режиме -p не может читать вне рабочей папки (Codex с read-only — может)
@@ -206,7 +210,8 @@ class CodexAgent(Agent):
         with tempfile.TemporaryDirectory() as d:
             schema, last = Path(d) / "schema.json", Path(d) / "last.txt"
             schema.write_text(json.dumps(SCHEMA), encoding="utf-8")
-            cmd = [resolve_exe(self.exe), "exec", "--sandbox", "read-only",
+            # --search — флаг самого codex, не exec: `codex exec --search` не принимается
+            cmd = [resolve_exe(self.exe)] + (["--search"] if self.web else []) + ["exec", "--sandbox", "read-only",
                    "--skip-git-repo-check", "--ephemeral", "--color", "never", "--json",
                    "-C", str(workdir), "--output-schema", str(schema), "-o", str(last)]
             if self.model:

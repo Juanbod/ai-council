@@ -434,3 +434,20 @@ def test_path_from_earlier_question_stays_linked(session, tmp_path):
     Debate([Spy("Claude", "stubborn"), Spy("Codex", "agree")], session, q, session.append,
            max_rounds=0).run()
     assert seen and all(s == ([str(proj)], [proj]) for s in seen)
+
+
+def test_web_is_shared_and_switches_next_round(session):
+    """Веб из одного снимка — обоим; включение посреди раунда действует со следующего."""
+    seen = {}
+
+    class Spy(MockAgent):
+        def ask(self, prompt, workdir, attachments, cancel=None):
+            st = json.loads(prompt.rsplit("<<STATE>>", 1)[1])
+            seen.setdefault(st["round"], {})[self.name] = (st["web"], self.web, "Интернет включён" in prompt)
+            if st["round"] == 0 and self.name == "Claude":
+                session.set(web=True)
+            return super().ask(prompt, workdir, attachments, cancel)
+
+    run(session, Spy("Claude", "stubborn", delay=0.1), Spy("Codex", "stubborn", delay=0.1), rounds=1)
+    assert seen[0] == {"Claude": (False, False, False), "Codex": (False, False, False)}
+    assert seen[1] == {"Claude": (True, True, True), "Codex": (True, True, True)}

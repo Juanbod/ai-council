@@ -110,3 +110,31 @@ def test_claude_gets_add_dir_for_outside_paths(captured, tmp_path):
     cmd = captured[0]["cmd"]
     dirs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--add-dir"]
     assert dirs == [str(outside.resolve())]  # вложения внутри рабочей папки доступны и так
+
+
+def test_claude_web_flags(captured, tmp_path):
+    def denied_and_allowed(web):
+        ag = ClaudeAgent()
+        ag.web = web
+        ag.ask("p", tmp_path, [])
+        cmd = captured[-1]["cmd"]
+        denied = set(cmd[cmd.index("--disallowedTools") + 1].split(","))
+        allowed = cmd[cmd.index("--allowedTools") + 1] if "--allowedTools" in cmd else ""
+        return denied, allowed
+
+    denied, allowed = denied_and_allowed(False)
+    assert {"WebFetch", "WebSearch"} <= denied and allowed == ""
+    denied, allowed = denied_and_allowed(True)
+    assert "WebFetch" not in denied and allowed == "WebFetch,WebSearch"
+    assert {"Edit", "Write", "NotebookEdit", "Bash"} <= denied  # запись и команды — никогда
+
+
+def test_codex_search_flag_goes_before_exec(captured, tmp_path):
+    ag = CodexAgent()
+    ag.ask("p", tmp_path, [])
+    assert "--search" not in captured[-1]["cmd"]
+    ag.web = True
+    ag.ask("p", tmp_path, [])
+    cmd = captured[-1]["cmd"]
+    assert cmd[1:3] == ["--search", "exec"]
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
