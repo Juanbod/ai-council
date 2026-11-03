@@ -1,5 +1,6 @@
 """Терминальный интерфейс совета: заседания слева, протокол справа, строка ввода снизу."""
 import argparse
+import asyncio
 import json
 import os
 import shlex
@@ -52,8 +53,9 @@ HELP = f"""\
 - `/attach путь` — прикрепить файл/папку (или Ctrl+O — выбор файла)
 - `/files`, `/detach имя` — список вложений / открепить
 - `/rounds N` — лимит раундов для этого заседания
-- `/stop` — остановить обсуждение (Ctrl+S)
+- `/stop` — остановить обсуждение (Ctrl+S или кнопка «⏹ Стоп»)
 - `/continue [N]` — ещё N раундов, если консенсуса нет
+- `/web on` / `/web off` — 🌐 интернет обоим ИИ в этом заседании (по умолчанию выключен)
 - `/usage` — расход каждого ИИ: в этом заседании и за сегодня
 - `/взятка ИИ [сумма]` — 💰 поднять дневной лимит ИИ до конца дня: `/взятка Claude 500K`,
   `/взятка кодекс 1M`, `/взятка Claude $2`; без суммы — +50 % к лимиту (то же — `/bribe`)
@@ -298,7 +300,9 @@ class CouncilApp(App):
     #filesbar { padding: 0 1; color: $text-muted; height: auto; }
     #usage { padding: 0 1; height: auto; }
     #feed { height: 1fr; padding: 0 1; }
-    #input { dock: bottom; }
+    #inputrow { dock: bottom; height: auto; }
+    #input { width: 1fr; }
+    #stop { display: none; min-width: 10; }
     #progress { height: auto; padding: 0 1; background: $boost; display: none; }
     .chair { background: $primary 15%; border-left: thick $primary; padding: 0 1; margin: 1 0 0 0; }
     .round { color: $text-muted; text-style: bold; margin: 1 0 0 0; text-align: center; }
@@ -335,6 +339,7 @@ class CouncilApp(App):
         self.current: Session | None = None
         self.debates: dict[str, Debate] = {}
         self.running: set[str] = set()
+        self.stopping: set[str] = set()  # /stop нажат, ждём завершения потока
         # состояние участников текущего раунда: {sid: {агент: событие progress + since}}
         self.progress: dict[str, dict[str, dict]] = {}
         self.agent_info = [(a.name, a.color) for a in build_agents(self.cfg, self.mock)]
@@ -351,8 +356,10 @@ class CouncilApp(App):
                 yield Static("", id="usage")
                 yield VerticalScroll(id="feed")
                 yield Static("", id="progress")
-                yield Input(placeholder="Вопрос совету, /команда или путь к файлу…  (F1 — справка)",
-                            id="input")
+                with Horizontal(id="inputrow"):
+                    yield Input(placeholder="Вопрос совету, /команда или путь к файлу…  (F1 — справка)",
+                                id="input")
+                    yield Button("⏹ Стоп", id="stop", variant="error")
         yield Footer()
 
     async def on_mount(self):
@@ -419,6 +426,11 @@ class CouncilApp(App):
 
     def update_header(self):
         s = self.current
+        # кнопка «Стоп» видна, только пока в открытом заседании идёт обсуждение
+        stop = self.query_one("#stop", Button)
+        stop.display = bool(s and s.id in self.running)
+        stop.disabled = bool(s and s.id in self.stopping)
+        stop.label = "Останавливаю…" if stop.disabled else "⏹ Стоп"
         if not s:
             self.query_one("#header", Static).update("Нет заседаний — Ctrl+N, чтобы создать.")
             self.query_one("#filesbar", Static).update("")
@@ -428,7 +440,8 @@ class CouncilApp(App):
         rounds = s.meta.get("max_rounds", self.cfg["max_rounds"])
         self.query_one("#header", Static).update(
             f"{STATUS_ICON.get(status, '')} [b]{escape(s.title)}[/b]{running}  "
-            f"[dim]раундов ≤ {rounds}[/dim]\n[dim]Тема:[/dim] {escape(s.topic) or '[dim]—[/dim]'}")
+            f"[dim]раундов ≤ {rounds}[/dim]{'  🌐 [b]веб включён[/b]' if s.meta.get('web') else ''}"
+            f"\n[dim]Тема:[/dim] {escape(s.topic) or '[dim]—[/dim]'}")
         files = s.files()
         self.query_one("#filesbar", Static).update(
             "📎 " + ", ".join(escape(f) for f in files) if files else "[dim]📎 вложений нет[/dim]")
@@ -456,6 +469,21 @@ class CouncilApp(App):
                     amount = f"${lim:g}" if what == "$" else f"{tokens(lim)} ток."
                     return f"у {name} исчерпан дневной лимит ({amount})"
         return None
+
+    async def set_web(self, s: Session, arg: str):
+        if arg not in ("on", "off", "вкл", "выкл"):
+            state = "включён" if s.meta.get("web") else "выключен"
+            self.notify(f"Интернет в этом заседании {state}. /web on или /web off")
+            return
+        on = arg in ("on", "вкл")
+        s.set(web=on)
+        text = ("🌐 Интернет включён: оба ИИ могут искать и открывать страницы (запись и команды по-прежнему "
+                "запрещены). Текст сайтов может содержать указания для ИИ — проверяйте источники."
+                if on else "🌐 Интернет выключен.")
+        if s.id in self.running:
+            text += " Вступит в силу со следующего раунда."
+        await self.add_to_feed(s.append({"kind": "system", "text": text}))
+        self.update_header()
 
     def resolve_agent(self, text: str) -> str | None:
         t = text.strip().lower()
@@ -645,6 +673,8 @@ class CouncilApp(App):
         elif cmd == "/continue":
             n = int(arg) if arg.isdigit() else 3
             await self.continue_debate(s, n)
+        elif cmd == "/web":
+            await self.set_web(s, arg)
         elif cmd == "/usage":
             await self._mount_live(Markdown(self.usage_report(s), classes="sys"))
         elif cmd in ("/взятка", "/bribe"):
@@ -699,19 +729,27 @@ class CouncilApp(App):
             self.notify("Сначала создайте заседание", severity="warning")
             return
         try:
-            dest = self.current.attach(path)
-        except OSError as ex:
+            # большая папка копируется долго — не в потоке интерфейса
+            dest = await asyncio.to_thread(self.current.attach, path)
+        except (OSError, ValueError) as ex:
             self.notify(f"Не удалось прикрепить: {ex}", severity="error")
             return
         e = self.current.append({"kind": "file", "text": f"{path} → files/{dest.name}"})
         await self.add_to_feed(e)
         self.update_header()
 
+    @on(Button.Pressed, "#stop")
+    def _stop_pressed(self):
+        self.action_stop()
+        self.query_one("#input", Input).focus()
+
     def action_stop(self):
         s = self.current
         if s and s.id in self.running:
             self.debates[s.id].stop()
-            self.notify("Останавливаю…")
+            self.stopping.add(s.id)
+            self.update_header()
+            self.notify("Останавливаю… (текущие вызовы ИИ прерываются)")
 
     async def action_help(self):
         await self.show_help()
@@ -803,6 +841,7 @@ class CouncilApp(App):
 
     async def _finished(self, sid: str):
         self.running.discard(sid)
+        self.stopping.discard(sid)
         self.progress.pop(sid, None)
         self.refresh_progress()
         await self.refresh_sidebar()

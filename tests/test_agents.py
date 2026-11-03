@@ -35,6 +35,38 @@ def test_run_cli_cancel_kills_process(tmp_path):
     assert time.monotonic() - t < 3
 
 
+# Как обёртка claude.cmd: настоящая работа — во внуке, который унаследовал stdout
+WRAPPER = ("import subprocess, sys, time; "
+           "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+           "open(sys.argv[1], 'w').write(str(p.pid)); time.sleep(60)")
+
+
+def test_cancel_kills_the_whole_process_tree(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    cancel = threading.Event()
+    threading.Timer(1.5, cancel.set).start()
+    t = time.monotonic()
+    with pytest.raises(Cancelled):
+        run_cli([sys.executable, "-c", WRAPPER, str(pid_file)], "", tmp_path, 120, cancel)
+    assert time.monotonic() - t < 20  # без убийства дерева communicate() ждал бы внука 60 с
+    pid = int(pid_file.read_text())
+    time.sleep(0.5)
+    assert not pid_alive(pid)
+
+
+def pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        import subprocess
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out
+    import os
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 @pytest.fixture
 def captured(monkeypatch):
     calls = []
@@ -110,3 +142,43 @@ def test_claude_gets_add_dir_for_outside_paths(captured, tmp_path):
     cmd = captured[0]["cmd"]
     dirs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--add-dir"]
     assert dirs == [str(outside.resolve())]  # вложения внутри рабочей папки доступны и так
+
+
+def test_claude_web_flags(captured, tmp_path):
+    def denied_and_allowed(web):
+        ag = ClaudeAgent()
+        ag.web = web
+        ag.ask("p", tmp_path, [])
+        cmd = captured[-1]["cmd"]
+        denied = set(cmd[cmd.index("--disallowedTools") + 1].split(","))
+        allowed = cmd[cmd.index("--allowedTools") + 1] if "--allowedTools" in cmd else ""
+        return denied, allowed
+
+    denied, allowed = denied_and_allowed(False)
+    assert {"WebFetch", "WebSearch"} <= denied and allowed == ""
+    denied, allowed = denied_and_allowed(True)
+    assert "WebFetch" not in denied and allowed == "WebFetch,WebSearch"
+    assert {"Edit", "Write", "NotebookEdit", "Bash"} <= denied  # запись и команды — никогда
+
+
+def test_codex_search_flag_goes_before_exec(captured, tmp_path):
+    ag = CodexAgent()
+    ag.ask("p", tmp_path, [])
+    assert "--search" not in captured[-1]["cmd"]
+    ag.web = True
+    ag.ask("p", tmp_path, [])
+    cmd = captured[-1]["cmd"]
+    assert cmd[1:3] == ["--search", "exec"]
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+
+
+def test_claude_gets_only_read_tools_without_mcp(captured, tmp_path):
+    ag = ClaudeAgent()
+    ag.ask("p", tmp_path, [])
+    cmd = captured[-1]["cmd"]
+    assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep"  # белый список, а не только запреты
+    assert "--strict-mcp-config" in cmd and "--no-session-persistence" in cmd
+    ag.web = True
+    ag.ask("p", tmp_path, [])
+    cmd = captured[-1]["cmd"]
+    assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep,WebFetch,WebSearch"

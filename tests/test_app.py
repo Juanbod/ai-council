@@ -277,3 +277,34 @@ async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatc
         await pilot.pause()
         assert not bar.display
         assert not any(e["kind"] == "progress" for e in s.events())
+
+
+@pytest.mark.asyncio
+async def test_stop_button_stops_debate(app, monkeypatch):
+    monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [
+        MockAgent("Claude", "stubborn", delay=2), MockAgent("Codex", "stubborn", delay=2)])
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Стоп")
+        s = app.current
+        stop = app.query_one("#stop")
+        assert not stop.display
+        await type_and_send(pilot, "вопрос")
+        assert stop.display
+        t = asyncio.get_running_loop().time()
+        await pilot.click("#stop")
+        await wait_idle(pilot, s.id)
+        assert asyncio.get_running_loop().time() - t < 1.5  # прервано, а не дождались вызовов по 2 с
+        await pilot.pause()
+        assert s.meta["status"] == "stopped" and not stop.display
+
+
+@pytest.mark.asyncio
+async def test_web_command_toggles_session(app):
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Веб")
+        s = app.current
+        await type_and_send(pilot, "/web on")
+        assert s.meta["web"] is True and "веб включён" in str(app.query_one("#header").render())
+        await type_and_send(pilot, "/web off")
+        assert s.meta["web"] is False and "веб" not in str(app.query_one("#header").render())
+        assert sum("Интернет" in e.get("text", "") for e in s.events() if e["kind"] == "system") == 2
