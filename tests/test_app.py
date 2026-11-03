@@ -308,3 +308,35 @@ async def test_web_command_toggles_session(app):
         await type_and_send(pilot, "/web off")
         assert s.meta["web"] is False and "веб" not in str(app.query_one("#header").render())
         assert sum("Интернет" in e.get("text", "") for e in s.events() if e["kind"] == "system") == 2
+
+
+@pytest.mark.asyncio
+async def test_copy_button_copies_message_text(app, monkeypatch):
+    copied = []
+    monkeypatch.setattr(app_mod, "windows_clipboard", copied.append)  # не трогаем настоящий буфер
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Копирование")
+        s = app.current
+        await type_and_send(pilot, "Какой [b]формат[/b] выбрать?")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        messages = list(app.query(app_mod.Message))
+        kinds = [m.classes for m in messages]
+        assert {"chair"} <= kinds[0] and {"verdict-ok"} <= kinds[-1]
+        assert sum("reply" in k for k in kinds) >= 2
+
+        async def copy(message):
+            message.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.click(message.query_one(".copy"))
+            await pilot.pause()
+            return app.clipboard
+
+        # разметка Rich в тексте председателя копируется как есть, а не съедается
+        assert await copy(messages[0]) == "Какой [b]формат[/b] выбрать?"
+        verdict = [e for e in s.events() if e["kind"] == "verdict"][-1]
+        assert await copy(messages[-1]) == verdict["answer"]  # из вердикта — только итоговый ответ
+        reply = next(m for m in messages if "reply" in m.classes)
+        assert (await copy(reply)).startswith("**Claude** · раунд 0")
+        if app_mod.os.name == "nt":
+            assert copied == [messages[0].text, verdict["answer"], reply.text]

@@ -286,6 +286,61 @@ class EggThrow(Static):
             self.update(f"[b]{who}[/b] 🫲{' ' * self.DISTANCE}💥🍳 [b]{to}[/b]  [i]шмяк![/i]")
 
 
+def windows_clipboard(text: str) -> bool:
+    """Буфер обмена Windows через WinAPI: OSC 52 (copy_to_clipboard) понимают не все терминалы."""
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32")
+    kernel32.GlobalAlloc.argtypes, kernel32.GlobalAlloc.restype = [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes, kernel32.GlobalLock.restype = [wintypes.HGLOBAL], ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes, user32.SetClipboardData.restype = [wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE
+    data = text.encode("utf-16-le") + b"\0\0"
+    if not user32.OpenClipboard(None):
+        return False
+    try:
+        user32.EmptyClipboard()
+        h = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        if not h:
+            return False
+        ctypes.memmove(kernel32.GlobalLock(h), data, len(data))
+        kernel32.GlobalUnlock(h)
+        if not user32.SetClipboardData(13, h):  # CF_UNICODETEXT; при успехе памятью владеет система
+            kernel32.GlobalFree(h)
+            return False
+        return True
+    finally:
+        user32.CloseClipboard()
+
+
+class Message(Horizontal):
+    """Сообщение ленты с кнопкой «⧉»: копирует его текст (Markdown-исходник, без разметки Rich)."""
+    DEFAULT_CSS = """
+    Message { height: auto; }
+    Message > .body { width: 1fr; height: auto; }
+    Message > .copy { width: 3; min-width: 3; color: $text-muted; background: transparent; }
+    Message > .copy:hover { color: $text; }
+    """
+
+    def __init__(self, body, text: str, classes: str = ""):
+        super().__init__(classes=classes)
+        self.body, self.text = body, text
+
+    def compose(self) -> ComposeResult:
+        self.body.add_class("body")
+        yield self.body
+        yield Button("⧉", classes="copy", compact=True, tooltip="Скопировать текст")
+
+    @on(Button.Pressed, ".copy")
+    def _copy(self, event: Button.Pressed):
+        event.stop()
+        self.app.copy_to_clipboard(self.text)
+        if os.name == "nt":
+            windows_clipboard(self.text)
+        self.app.notify("Текст скопирован", timeout=2)
+
+
 # ---------------- основное приложение ----------------
 
 class CouncilApp(App):
@@ -536,9 +591,9 @@ class CouncilApp(App):
     def render_event(self, e: dict):
         k = e.get("kind")
         if k == "question":
-            return Static(f"[b]🧑 Председатель:[/b] {escape(e['text'])}", classes="chair")
+            return Message(Static(f"[b]🧑 Председатель:[/b] {escape(e['text'])}"), e["text"], "chair")
         if k == "chair":
-            return Static(f"[b]🧑 Председатель (реплика):[/b] {escape(e['text'])}", classes="chair")
+            return Message(Static(f"[b]🧑 Председатель (реплика):[/b] {escape(e['text'])}"), e["text"], "chair")
         if k == "round":
             return Static(f"── {e['text']} ──", classes="round")
         if k == "reply":
@@ -560,7 +615,8 @@ class CouncilApp(App):
             if e.get("proposed"):
                 quoted = "\n".join("> " + line for line in e["proposal_text"].splitlines())
                 md.append(f"**Предлагает итог `{e['proposed']}`:**\n{quoted}")
-            w = Markdown("\n\n".join(md), classes="reply")
+            text = "\n\n".join(md)
+            w = Message(Markdown(text), text, "reply")
             w.styles.border_left = ("thick", agent[1])
             return w
         if k == "warning":
@@ -570,8 +626,10 @@ class CouncilApp(App):
         if k == "verdict":
             eggs = egg_score(e)
             if e["consensus"]:
-                return Markdown(f"### ✅ Консенсус за {e['rounds']} р. — вариант `{e['id']}`\n\n"
-                                + e["answer"] + (f"\n\n{eggs}" if eggs else ""), classes="verdict-ok")
+                # копируется сам итоговый ответ — ради него обычно и нажимают
+                return Message(Markdown(f"### ✅ Консенсус за {e['rounds']} р. — вариант `{e['id']}`\n\n"
+                                        + e["answer"] + (f"\n\n{eggs}" if eggs else "")),
+                               e["answer"], "verdict-ok")
             if e.get("stopped"):
                 return Markdown("### ⏹ Обсуждение остановлено", classes="verdict-no")
             parts = [f"### ⚖️ Консенсус не достигнут (раундов: {e['rounds']})",
@@ -580,7 +638,8 @@ class CouncilApp(App):
                 parts.append(f"**{name}:** {pos}")
             if eggs:
                 parts.append(eggs)
-            return Markdown("\n\n".join(parts), classes="verdict-no")
+            text = "\n\n".join(parts)
+            return Message(Markdown(text), text, "verdict-no")
         if k == "file":
             return Static(f"📎 прикреплено: {escape(e['text'])}", classes="sys")
         if k == "bribe":
