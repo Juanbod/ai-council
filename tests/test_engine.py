@@ -319,3 +319,118 @@ def test_resume_keeps_egg_stock_and_reads_old_protocols(session):
                     "proposed": "", "proposal_text": ""})
     d2 = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], old, old.append)
     assert d2.round == 1 and d2.eggs_left() == {"Claude": 3, "Codex": 3}
+
+
+# ---------- расход и лимиты ----------
+
+def test_reply_usage_counts_failed_attempts_too(session):
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([MockAgent("Claude", "stubborn"), MockAgent("Codex", "flaky")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=1)
+    d.run()
+    first = {e["agent"]: e["usage"] for e in events if e["kind"] == "reply" and e["round"] == 0}
+    assert first["Claude"]["calls"] == 1 and first["Codex"]["calls"] == 2
+    assert first["Codex"]["tokens_in"] > first["Claude"]["tokens_in"]
+    assert "usage" not in d.log[0]  # участникам расход не показывается
+
+
+def test_budget_check_pauses_before_round(session):
+    events = []
+    checks = iter([None, None, "у Claude исчерпан дневной лимит"])
+    session.append({"kind": "question", "text": "q"})
+    d = Debate([MockAgent("Claude", "stubborn"), MockAgent("Codex", "stubborn")], session, "q",
+               lambda e: events.append(session.append(e)), max_rounds=5,
+               budget_check=lambda: next(checks))
+    v = d.run()
+    assert v["stopped"] and not v["consensus"] and d.round == 2
+    assert {e["round"] for e in events if e["kind"] == "reply"} == {0, 1}
+    assert any(e["kind"] == "system" and "лимит" in e["text"] for e in events)
+
+
+def test_usage_totals_skips_old_and_earlier_events():
+    from council.store import usage_totals
+    events = [
+        {"kind": "reply", "agent": "Claude", "ts": 5, "usage": {"tokens_in": 10, "calls": 1}},
+        {"kind": "reply", "agent": "Claude", "ts": 20, "usage": {"tokens_in": 7, "cost_usd": 0.5, "calls": 1}},
+        {"kind": "reply", "agent": "Codex", "ts": 20},  # старый протокол без usage
+        {"kind": "system", "ts": 20, "usage": {"tokens_in": 99}},
+    ]
+    assert usage_totals(events)["Claude"]["tokens_in"] == 17
+    today = usage_totals(events, since=10)
+    assert today == {"Claude": {"tokens_in": 7, "tokens_out": 0, "cost_usd": 0.5, "seconds": 0, "calls": 1}}
+
+
+# ---------- пути из текста председателя ----------
+
+def test_find_paths_in_chair_text(tmp_path):
+    from council.engine import find_paths
+    proj = tmp_path / "Fuji-XE2-Research"
+    proj.mkdir()
+    spaced = tmp_path / "с пробелом.txt"
+    spaced.write_text("x", encoding="utf-8")
+    text = f'вот путь к проекту: {proj}, и ещё "{spaced}". А этого нет: {tmp_path / "nope"}'
+    assert find_paths(text) == [proj, spaced]
+
+
+def test_linked_paths_reach_both_agents_and_claude_gets_add_dir(session, tmp_path):
+    """Регрессия: путь, указанный в вопросе, Codex читал, а Claude получал отказ в доступе."""
+    proj = tmp_path / "project"
+    proj.mkdir()
+    seen = {}
+
+    class Spy(MockAgent):
+        def ask(self, prompt, workdir, attachments, cancel=None):
+            st = json.loads(prompt.rsplit("<<STATE>>", 1)[1])
+            seen[self.name] = (st["linked_paths"], list(attachments))
+            return super().ask(prompt, workdir, attachments, cancel)
+
+    q = f"изучите проект: {proj}"
+    session.append({"kind": "question", "text": q})
+    Debate([Spy("Claude", "stubborn"), Spy("Codex", "agree")], session, q, session.append,
+           max_rounds=1).run()
+    assert seen["Claude"] == seen["Codex"] == ([str(proj)], [proj])
+
+
+def test_progress_events_per_agent(session):
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    Debate([MockAgent("Claude", "stubborn"), MockAgent("Codex", "flaky")], session, "q",
+           events.append, max_rounds=1).run()
+    states = lambda name, rnd: [e["state"] for e in events
+                                if e["kind"] == "progress" and e["agent"] == name and e["round"] == rnd]
+    assert states("Claude", 0) == ["thinking", "done"]
+    assert states("Codex", 0) == ["thinking", "retry", "done"]  # первый ответ flaky — битый
+
+
+def test_progress_reports_failure(session):
+    class Broken(MockAgent):
+        def ask(self, *a, **k):
+            return "не json"
+
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    Debate([Broken("Claude"), MockAgent("Codex")], session, "q", events.append, max_rounds=0).run()
+    assert [e["state"] for e in events if e["kind"] == "progress" and e["agent"] == "Claude"] == \
+        ["thinking", "retry", "failed"]
+
+
+def test_path_from_earlier_question_stays_linked(session, tmp_path):
+    """Регрессия: второй вопрос без пути («пересмотрите проект») снова оставлял Claude без доступа."""
+    proj = tmp_path / "Fuji-XE2-Research"
+    proj.mkdir()
+    run(session, MockAgent("Claude", "stubborn"), MockAgent("Codex", "agree"))  # вопрос без пути
+    session.append({"kind": "question", "text": f"изучите проект: {proj}"})
+    session.append({"kind": "chair", "text": "без пути"})
+    seen = []
+
+    class Spy(MockAgent):
+        def ask(self, prompt, workdir, attachments, cancel=None):
+            seen.append((json.loads(prompt.rsplit("<<STATE>>", 1)[1])["linked_paths"], list(attachments)))
+            return super().ask(prompt, workdir, attachments, cancel)
+
+    q = "доступ предоставлен, пересмотрите проект"
+    session.append({"kind": "question", "text": q})
+    Debate([Spy("Claude", "stubborn"), Spy("Codex", "agree")], session, q, session.append,
+           max_rounds=0).run()
+    assert seen and all(s == ([str(proj)], [proj]) for s in seen)

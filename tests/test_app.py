@@ -135,3 +135,145 @@ async def test_eggs_shown_in_feed_and_export(tmp_path, monkeypatch):
         await type_and_send(pilot, "/export")
         protocol = (s.root / "protocol.md").read_text(encoding="utf-8")
         assert "Бросает яйцо" in protocol and "Брошено яиц: Claude — 3, Codex — 0" in protocol
+
+
+@pytest.mark.asyncio
+async def test_new_session_button_opens_dialog(app):
+    """Регрессия: кнопка «+ Новое заседание» не реагировала, работал только Ctrl+N."""
+    async with app.run_test(size=(140, 45)) as pilot:
+        await pilot.click("#new")
+        await pilot.pause()
+        assert isinstance(app.screen, app_mod.NewSessionScreen)
+        app.screen.query_one("#title").value = "Через кнопку"
+        await pilot.click("#ok")
+        await pilot.pause()
+        assert app.current and app.current.title == "Через кнопку"
+
+
+@pytest.mark.asyncio
+async def test_egg_throw_animation_plays_for_live_eggs(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_mod, "BASE", tmp_path)
+    monkeypatch.setattr(app_mod.EggThrow, "STEP", 0.01)
+    app = CouncilApp(mock="hothead,agree")
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Рада")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await wait_idle(pilot, s.id)
+        await asyncio.sleep(0.5)
+        throws = list(app.query(app_mod.EggThrow))
+        assert len(throws) == 3 and all(t.done for t in throws)
+        assert "шмяк" in str(throws[0].render())
+
+        await type_and_send(pilot, "/new Другое")
+        await pilot.press("ctrl+pagedown")  # повторное открытие: история без анимации
+        await pilot.pause()
+        assert app.current.id == s.id and not list(app.query(app_mod.EggThrow))
+
+
+@pytest.mark.asyncio
+async def test_usage_indicator_and_daily_limit(app):
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Расход")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        line = str(app.query_one("#usage").render())
+        assert "Claude" in line and "Codex" in line and "ток." in line
+
+        app.cfg["limits"] = {"Claude": {"daily_tokens": 1}}  # уже превышен
+        await pilot.pause()
+        app.update_usage()
+        assert "лимит исчерпан" in str(app.query_one("#usage").render())
+        await type_and_send(pilot, "второй вопрос")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert s.meta["status"] == "stopped"
+        assert any(e["kind"] == "system" and "лимит" in e["text"] for e in s.events())
+
+        await type_and_send(pilot, "/usage")
+        assert "Расход ИИ" in app.query(app_mod.Markdown).last().source
+
+
+def test_old_config_gets_limits_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_mod, "BASE", tmp_path)
+    (tmp_path / "config.json").write_text('{"max_rounds": 7}', encoding="utf-8")
+    cfg = app_mod.load_config()
+    assert cfg["max_rounds"] == 7 and "limits" in cfg
+    saved = (tmp_path / "config.json").read_text(encoding="utf-8")
+    assert '"limits"' in saved and '"max_rounds": 7' in saved
+
+
+def test_parse_bribe_amount():
+    from council.app import parse_amount
+    assert parse_amount("500K") == ("daily_tokens", 500_000)
+    assert parse_amount("1,5м") == ("daily_tokens", 1_500_000)
+    assert parse_amount("20000") == ("daily_tokens", 20_000)
+    assert parse_amount("$2") == ("daily_cost_usd", 2) == parse_amount("2$")
+    assert parse_amount("много") is None and parse_amount("-5") is None and parse_amount("") is None
+
+
+def test_bribes_count_only_today():
+    from council.store import bribe_totals
+    events = [{"kind": "bribe", "agent": "Claude", "limit": "daily_tokens", "amount": 100, "ts": 5},
+              {"kind": "bribe", "agent": "Claude", "limit": "daily_tokens", "amount": 30, "ts": 20},
+              {"kind": "bribe", "agent": "Claude", "limit": "daily_cost_usd", "amount": 2, "ts": 20}]
+    assert bribe_totals(events, since=10) == {"Claude": {"daily_tokens": 30, "daily_cost_usd": 2}}
+
+
+@pytest.mark.asyncio
+async def test_bribe_raises_limit_and_debate_continues(app):
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Взятка")
+        s = app.current
+        app.cfg["limits"] = {"Claude": {"daily_tokens": 1}, "Codex": {"daily_tokens": 0}}
+        await type_and_send(pilot, "вопрос")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert s.meta["status"] == "stopped"  # лимит исчерпан ещё до первого раунда
+
+        await type_and_send(pilot, "/взятка кодекс 1M")  # у Codex лимита нет — взятка не принимается
+        assert not any(e["kind"] == "bribe" for e in s.events())
+
+        await type_and_send(pilot, "/взятка клод")  # без суммы: +50 % от лимита в 1 токен
+        await type_and_send(pilot, "/bribe Claude 10M")
+        bribes = [e for e in s.events() if e["kind"] == "bribe"]
+        assert [b["amount"] for b in bribes] == [0.5, 10_000_000]
+        assert bribes[-1]["total"] == 10_000_001.5
+        assert "исчерпан" not in str(app.query_one("#usage").render())
+
+        await type_and_send(pilot, "/continue 3")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert s.meta["status"] == "consensus"
+        await type_and_send(pilot, "/export")
+        assert "Взятка Claude" in (s.root / "protocol.md").read_text(encoding="utf-8")
+
+
+def test_progress_line_states():
+    from council.app import progress_line
+    states = {"Claude": {"state": "thinking", "round": 1, "since": 100.0, "seconds": 0},
+              "Codex": {"state": "done", "round": 1, "since": 90.0, "seconds": 8.4}}
+    line = progress_line(["Claude", "Codex"], states, now=112.0)
+    assert "Раунд 1" in line and "Claude[/b] думает… 12 с" in line and "Codex[/b] ответил за 8 с" in line
+    assert "ждёт" in progress_line(["Claude", "Codex"], {"Claude": states["Claude"]}, now=100.0)
+
+
+@pytest.mark.asyncio
+async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatch):
+    monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [
+        MockAgent("Claude", "stubborn", delay=0.6), MockAgent("Codex", "agree", delay=0.1)])
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Индикатор")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await asyncio.sleep(0.35)
+        await pilot.pause()
+        bar = app.query_one("#progress")
+        text = str(bar.render())
+        assert bar.display and "Claude" in text and "думает" in text and "ответил" in text
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert not bar.display
+        assert not any(e["kind"] == "progress" for e in s.events())

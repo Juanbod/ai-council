@@ -2,7 +2,9 @@
 import hashlib
 import json
 import queue
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -37,6 +39,20 @@ egg ("" если не бросаешь)."""
 EGGS_PER_DEBATE = 3
 
 
+# Абсолютный путь Windows: в кавычках (может содержать пробелы) или без них (до пробела)
+PATH_RE = re.compile(r'"([A-Za-z]:\\[^"]+)"|([A-Za-z]:\\[^\s"\'<>|?*]+)')
+
+
+def find_paths(text: str) -> list[Path]:
+    """Существующие абсолютные пути, упомянутые председателем в тексте."""
+    out: list[Path] = []
+    for m in PATH_RE.finditer(text or ""):
+        p = Path((m.group(1) or m.group(2)).rstrip(".,;:!?)»"))
+        if p.exists() and p not in out:
+            out.append(p)
+    return out
+
+
 def proposal_id(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:8]
 
@@ -45,10 +61,13 @@ class Debate:
     """Одно обсуждение вопроса председателя. emit(event) вызывается из рабочего потока."""
 
     def __init__(self, agents: list[Agent], session, question: str, emit,
-                 max_rounds: int = 5, history_full_rounds: int = 2, eggs: int = EGGS_PER_DEBATE):
+                 max_rounds: int = 5, history_full_rounds: int = 2, eggs: int = EGGS_PER_DEBATE,
+                 budget_check=None):
         assert len(agents) == 2, "протокол рассчитан на двух участников"
         self.agents, self.session, self.question = agents, session, question
         self.emit, self.max_rounds, self.eggs = emit, max_rounds, eggs
+        # budget_check() -> str | None: причина не начинать раунд (исчерпан лимит участника)
+        self.budget_check = budget_check
         self.history_full_rounds = history_full_rounds
         self.cancel = threading.Event()
         self.chair_notes: queue.Queue[str] = queue.Queue()
@@ -132,18 +151,25 @@ class Debate:
         """Общее состояние раунда: читается с диска один раз и одинаково для обоих участников.
         Изменения председателя (тема, вложения) попадут только в следующий снимок."""
         files = self.session.files()
+        # путь, однажды названный в заседании, остаётся открытым и для следующих вопросов
+        said = [self.session.topic] + [e["text"] for e in self.session.events()
+                                       if e.get("kind") in ("question", "chair")]
+        said += [self.question] + [n["text"] for n in self.notes]
+        linked = list(dict.fromkeys(p for t in said for p in find_paths(t)))
         shared = {
             "round": self.round, "max_rounds": self.max_rounds,
             "session_title": self.session.title, "session_topic": self.session.topic,
             "question": self.question,
             "files": [f"files/{f}" for f in files],
+            "linked_paths": [str(p) for p in linked],
             "prior_decisions_in_session": self._prior_decisions(),
             "chair_notes": list(self.notes),
             "debate_log": self._compact_log(),
             "candidates": list(self.candidates),
             "eggs_left": self.eggs_left(),
         }
-        attachments = [Path(self.session.files_dir) / f.rstrip("/") for f in files]
+        # пути из текста председателя — тоже вложения: Claude получит к ним --add-dir
+        attachments = [Path(self.session.files_dir) / f.rstrip("/") for f in files] + linked
         return json.loads(json.dumps(shared, ensure_ascii=False)), attachments
 
     def _prompt(self, me: Agent, other: Agent, shared: dict) -> str:
@@ -151,32 +177,58 @@ class Debate:
         intro = RULES.format(me=me.name, other=other.name, eggs=self.eggs)
         if shared["files"]:
             intro += "\n\nФайлы заседания лежат в рабочей папке в каталоге files/."
+        if shared["linked_paths"]:
+            intro += ("\n\nПредседатель указал пути на диске (linked_paths) — изучи их сам, доступ на "
+                      "чтение есть: " + "; ".join(shared["linked_paths"]))
         return (intro + "\n\nСостояние заседания (JSON) после метки:\n<<STATE>>"
                 + json.dumps(state, ensure_ascii=False, indent=1))
 
     # --- вызов с проверкой схемы ---
+    def _progress(self, agent: Agent, state: str, seconds: float = 0.0):
+        """Состояние участника для индикатора (transient: приложение не пишет его в протокол)."""
+        self.emit({"kind": "progress", "agent": agent.name, "state": state, "round": self.round,
+                   "seconds": round(seconds, 1)})
+
     def _ask(self, agent: Agent, prompt: str, attachments: list[Path]) -> dict:
+        """Ответ участника с полем usage — суммарный расход всех попыток, включая неудачные."""
+        spent = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "seconds": 0.0, "calls": 0}
+
+        def account(t0):
+            u = agent.last_usage or {}
+            for k in ("tokens_in", "tokens_out", "cost_usd"):
+                spent[k] += u.get(k, 0)
+            spent["seconds"] += time.monotonic() - t0
+            spent["calls"] += 1
+
         last_err = ""
         for attempt in range(2):
             p = prompt if not last_err else (
                 prompt + f"\n\nТвой предыдущий ответ отклонён модератором: {last_err}\n"
                          "Верни ТОЛЬКО один JSON-объект по схеме.")
+            t0 = time.monotonic()
+            agent.last_usage = None
+            self._progress(agent, "thinking" if attempt == 0 else "retry")
             try:
                 raw = agent.ask(p, self.session.root, attachments, self.cancel)
+                account(t0)
                 if not raw or not raw.strip():
                     raise ValueError("пустой ответ")
                 data = extract_json(raw)
                 validate(data, SCHEMA)
-                return {"ok": True, **data}
+                self._progress(agent, "done", spent["seconds"])
+                return {"ok": True, **data, "usage": spent}
             except Cancelled:
                 raise
             except (AgentError, ValueError, ValidationError, OSError) as e:
+                if spent["calls"] == attempt:  # сам вызов упал — время всё равно потрачено
+                    account(t0)
                 last_err = (e.message if isinstance(e, ValidationError) else str(e))[:500]
                 self.emit({"kind": "warning", "agent": agent.name,
                            "text": f"попытка {attempt + 1}: {last_err}"})
+        self._progress(agent, "failed", spent["seconds"])
         # сбой участника = несогласие, а не молчаливое ACCEPT
         return {"ok": False, "position": "", "critique": f"[сбой: {last_err}]", "questions": [],
-                "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": ""}
+                "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": "", "usage": spent}
 
     def add_chair_note(self, text: str):
         self.chair_notes.put(text)
@@ -193,6 +245,11 @@ class Debate:
                 while not self.chair_notes.empty():
                     note = {"round": self.round, "text": self.chair_notes.get()}
                     self.notes.append(note)
+                reason = self.budget_check() if self.budget_check else None
+                if reason:
+                    self.emit({"kind": "system", "text": f"⛽ Обсуждение приостановлено: {reason}. "
+                                                         "Поднимите лимит в config.json или продолжите завтра."})
+                    return self._finish(False, "", "", stopped=True)
                 self.emit({"kind": "round", "round": self.round,
                            "text": "Независимый анализ" if self.round == 0 else f"Раунд {self.round}"})
                 # один снимок состояния для обоих, вызовы параллельно
@@ -231,8 +288,9 @@ class Debate:
                              "vote": r["vote"], "vote_id": r["vote_id"], "proposed": new_id,
                              "egg": eggs[ag.name]}
                     self.log.append(entry)
+                    # расход пишется в протокол, но не входит в log: участникам он не показывается
                     self.emit({"kind": "reply", "ok": r["ok"], **entry,
-                               "proposal_text": r["new_proposal"].strip()})
+                               "proposal_text": r["new_proposal"].strip(), "usage": r["usage"]})
 
                 if agreed_id and not consensus_id:
                     self.emit({"kind": "system", "text": "🥚 Голосование сорвано: летели яйца. "

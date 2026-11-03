@@ -17,7 +17,7 @@ from textual.widgets import (Button, DirectoryTree, Footer, Input, Label, ListIt
 
 from .agents import build_agents
 from .engine import EGGS_PER_DEBATE, Debate
-from .store import Session, Store
+from .store import Session, Store, usage_totals
 
 BASE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = {
@@ -28,7 +28,17 @@ DEFAULT_CONFIG = {
          "use_json_schema": True},
         {"type": "codex", "name": "Codex", "exe": "codex", "model": "", "timeout": 900},
     ],
+    # дневные лимиты расхода самого приложения (0 — без лимита); перед раундом проверяются,
+    # при исчерпании обсуждение приостанавливается. Остаток подписки CLI не сообщают.
+    "limits": {"Claude": {"daily_tokens": 0, "daily_cost_usd": 0},
+               "Codex": {"daily_tokens": 0}},
 }
+
+WARN_AT = 0.8  # доля лимита, после которой индикатор желтеет
+BRIBE_SHARE = 0.5  # взятка без суммы — +50 % к базовому дневному лимиту
+AGENT_ALIASES = {"клод": "Claude", "кодекс": "Codex"}
+BRIBE_REACTIONS = ["молча берёт конверт", "делает вид, что ничего не было", "благодарит за «спонсорскую помощь»",
+                   "прячет конверт под регламент", "обещает голосовать по совести"]
 
 STATUS_ICON = {"idle": "·", "running": "⏳", "consensus": "✅", "no_consensus": "⚖️", "stopped": "⏹"}
 
@@ -44,6 +54,9 @@ HELP = f"""\
 - `/rounds N` — лимит раундов для этого заседания
 - `/stop` — остановить обсуждение (Ctrl+S)
 - `/continue [N]` — ещё N раундов, если консенсуса нет
+- `/usage` — расход каждого ИИ: в этом заседании и за сегодня
+- `/взятка ИИ [сумма]` — 💰 поднять дневной лимит ИИ до конца дня: `/взятка Claude 500K`,
+  `/взятка кодекс 1M`, `/взятка Claude $2`; без суммы — +50 % к лимиту (то же — `/bribe`)
 - `/export` — сохранить протокол в Markdown
 - `/open` — открыть папку заседания
 - `/delete confirm` — удалить заседание
@@ -58,8 +71,94 @@ def load_config() -> dict:
     path = BASE / "config.json"
     if not path.exists():
         path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
-    cfg = {**DEFAULT_CONFIG, **json.loads(path.read_text(encoding="utf-8"))}
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    cfg = {**DEFAULT_CONFIG, **saved}
+    if cfg.keys() != saved.keys():  # новые разделы (например, limits) — дописать, чтобы их было видно
+        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return cfg
+
+
+def tokens(n: float) -> str:
+    return f"{n / 1_000_000:.1f}M" if n >= 1_000_000 else f"{n / 1000:.0f}K" if n >= 1000 else str(int(n))
+
+
+def bar(frac: float, width: int = 8) -> str:
+    filled = min(width, round(frac * width))
+    if frac >= 1:
+        return f"[red]{'▰' * width} лимит исчерпан[/red]"
+    color = "yellow" if frac >= WARN_AT else "green"
+    return f"[{color}]{'▰' * filled}[/{color}][dim]{'▱' * (width - filled)}[/dim] {frac:.0%}"
+
+
+def budget_usage(used: dict, limit: dict) -> list[tuple[str, float, float]]:
+    """[(что, израсходовано, лимит)] для заданных лимитов участника."""
+    out = []
+    if limit.get("daily_tokens"):
+        out.append(("ток.", used.get("tokens_in", 0) + used.get("tokens_out", 0), limit["daily_tokens"]))
+    if limit.get("daily_cost_usd"):
+        out.append(("$", used.get("cost_usd", 0), limit["daily_cost_usd"]))
+    return out
+
+
+def parse_amount(text: str) -> tuple[str, float] | None:
+    """«500K», «1.5M», «20000» → токены; «$2», «2$» → доллары. Возвращает (ключ лимита, сумма)."""
+    t = text.strip().lower().replace(",", ".").replace(" ", "")
+    if not t:
+        return None
+    key = "daily_tokens"
+    if t.startswith("$") or t.endswith("$"):
+        key, t = "daily_cost_usd", t.strip("$")
+    mult = 1
+    if key == "daily_tokens" and t[-1:] in ("k", "к", "m", "м"):
+        mult = 1000 if t[-1] in "kк" else 1_000_000
+        t = t[:-1]
+    try:
+        value = float(t) * mult
+    except ValueError:
+        return None
+    return (key, value) if value > 0 else None
+
+
+def amount_text(key: str, value: float) -> str:
+    return f"${value:g}" if key == "daily_cost_usd" else f"{tokens(value)} ток."
+
+
+def usage_line(names: list[str], today: dict, limits: dict) -> str:
+    """Индикатор для шапки: расход за сегодня и заполненность дневного лимита по каждому ИИ."""
+    parts = []
+    for name in names:
+        u = today.get(name, {})
+        text = f"[b]{escape(name)}[/b] {tokens(u.get('tokens_in', 0) + u.get('tokens_out', 0))} ток."
+        if u.get("cost_usd"):
+            text += f" · ${u['cost_usd']:.2f}"
+        checks = budget_usage(u, limits.get(name, {}))
+        if checks:
+            text += " " + bar(max(used / lim for _, used, lim in checks))
+        parts.append(text)
+    return "⛽ сегодня: " + "  │  ".join(parts)
+
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def progress_line(names: list[str], states: dict, now: float) -> str:
+    rnd = next(iter(states.values()))["round"]
+    head = "Независимый анализ" if rnd == 0 else f"Раунд {rnd}"
+    parts = []
+    for name in names:
+        st, who = states.get(name), f"[b]{escape(name)}[/b]"
+        if not st:
+            parts.append(f"· {who} ждёт")
+            continue
+        elapsed = now - st["since"]
+        spin = SPINNER[int(now * 8) % len(SPINNER)]
+        parts.append({
+            "thinking": f"{spin} {who} думает… {elapsed:.0f} с",
+            "retry": f"{spin} {who} переделывает ответ (не по схеме)… {elapsed:.0f} с",
+            "done": f"[green]✓[/green] {who} ответил за {st['seconds']:.0f} с",
+            "failed": f"[red]✗[/red] {who} — сбой, засчитан REJECT",
+        }.get(st["state"], who))
+    return f"[dim]{head}:[/dim]  " + "   │   ".join(parts)
 
 
 def egg_score(verdict: dict) -> str:
@@ -157,6 +256,34 @@ class AttachScreen(ModalScreen[Path | None]):
         self.dismiss(None)
 
 
+class EggThrow(Static):
+    """Летящее яйцо: проигрывается только для живых событий, в истории заседания — обычная реплика."""
+    DISTANCE, STEP = 20, 0.05  # клеток полёта и секунд на кадр
+
+    def __init__(self, thrower: str, target: str):
+        super().__init__(classes="egg")
+        self.thrower, self.target, self.pos, self.done = thrower, target, 0, False
+
+    def on_mount(self):
+        self._frame()
+        self._timer = self.set_interval(self.STEP, self._tick)
+
+    def _tick(self):
+        self.pos += 1
+        self._frame()
+        if self.pos >= self.DISTANCE:
+            self._timer.stop()
+            self.done = True
+
+    def _frame(self):
+        who, to = escape(self.thrower), escape(self.target)
+        if self.pos < self.DISTANCE:
+            gap, rest = " " * self.pos, " " * (self.DISTANCE - self.pos)
+            self.update(f"[b]{who}[/b] 🫲{gap}🥚{rest}  [b]{to}[/b]")
+        else:
+            self.update(f"[b]{who}[/b] 🫲{' ' * self.DISTANCE}💥🍳 [b]{to}[/b]  [i]шмяк![/i]")
+
+
 # ---------------- основное приложение ----------------
 
 class CouncilApp(App):
@@ -169,12 +296,16 @@ class CouncilApp(App):
     #main { width: 1fr; }
     #header { padding: 0 1; background: $boost; height: auto; }
     #filesbar { padding: 0 1; color: $text-muted; height: auto; }
+    #usage { padding: 0 1; height: auto; }
     #feed { height: 1fr; padding: 0 1; }
     #input { dock: bottom; }
+    #progress { height: auto; padding: 0 1; background: $boost; display: none; }
     .chair { background: $primary 15%; border-left: thick $primary; padding: 0 1; margin: 1 0 0 0; }
     .round { color: $text-muted; text-style: bold; margin: 1 0 0 0; text-align: center; }
     .reply { border-left: thick $panel; padding: 0 1; margin: 1 0 0 0; }
     .warn { color: $warning; }
+    .egg { color: $warning; margin: 1 0 0 0; height: 1; }
+    .bribe { color: $success; margin: 1 0 0 0; }
     .sys { color: $text-muted; }
     .verdict-ok { border: round $success; padding: 0 1; margin: 1 0; }
     .verdict-no { border: round $warning; padding: 0 1; margin: 1 0; }
@@ -204,6 +335,9 @@ class CouncilApp(App):
         self.current: Session | None = None
         self.debates: dict[str, Debate] = {}
         self.running: set[str] = set()
+        # состояние участников текущего раунда: {sid: {агент: событие progress + since}}
+        self.progress: dict[str, dict[str, dict]] = {}
+        self.agent_info = [(a.name, a.color) for a in build_agents(self.cfg, self.mock)]
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -214,7 +348,9 @@ class CouncilApp(App):
             with Vertical(id="main"):
                 yield Static("", id="header")
                 yield Static("", id="filesbar")
+                yield Static("", id="usage")
                 yield VerticalScroll(id="feed")
+                yield Static("", id="progress")
                 yield Input(placeholder="Вопрос совету, /команда или путь к файлу…  (F1 — справка)",
                             id="input")
         yield Footer()
@@ -231,6 +367,9 @@ class CouncilApp(App):
         else:
             await self.show_help()
         self.query_one("#input", Input).focus()
+        # ссылка, а не query_one: таймер тикает и когда сверху модальное окно (там #progress не найти)
+        self.progress_bar = self.query_one("#progress", Static)
+        self.set_interval(0.25, self.refresh_progress)
 
     # ---------- боковая панель ----------
     async def refresh_sidebar(self):
@@ -252,6 +391,10 @@ class CouncilApp(App):
         if s and (not self.current or s.id != self.current.id):
             await self.open_session(s)
         self.query_one("#input", Input).focus()
+
+    @on(Button.Pressed, "#new")
+    def _new_pressed(self):
+        self.action_new_session()
 
     async def action_switch(self, step: int):
         if not self.sessions:
@@ -289,6 +432,78 @@ class CouncilApp(App):
         files = s.files()
         self.query_one("#filesbar", Static).update(
             "📎 " + ", ".join(escape(f) for f in files) if files else "[dim]📎 вложений нет[/dim]")
+        self.update_usage()
+
+    def update_usage(self):
+        names = [n for n, _ in self._agents_info()]
+        self.query_one("#usage", Static).update(
+            usage_line(names, self.store.usage_today(), self.limits_today()))
+
+    def limits_today(self) -> dict:
+        """Лимиты из config.json плюс сегодняшние взятки. Без базового лимита взятка ничего не меняет."""
+        bribes = self.store.bribes_today()
+        out = {}
+        for name, limit in self.cfg.get("limits", {}).items():
+            out[name] = {k: v + bribes.get(name, {}).get(k, 0) if v else v for k, v in limit.items()}
+        return out
+
+    def budget_check(self) -> str | None:
+        """Вызывается движком перед каждым раундом (из рабочего потока)."""
+        today = self.store.usage_today()
+        for name, limit in self.limits_today().items():
+            for what, used, lim in budget_usage(today.get(name, {}), limit):
+                if used >= lim:
+                    amount = f"${lim:g}" if what == "$" else f"{tokens(lim)} ток."
+                    return f"у {name} исчерпан дневной лимит ({amount})"
+        return None
+
+    def resolve_agent(self, text: str) -> str | None:
+        t = text.strip().lower()
+        if not t:
+            return None
+        names = [n for n, _ in self._agents_info()]
+        return AGENT_ALIASES.get(t) or next((n for n in names if n.lower().startswith(t)), None)
+
+    async def bribe(self, s: Session, arg: str):
+        who, _, how_much = arg.partition(" ")
+        name = self.resolve_agent(who)
+        if not name:
+            self.notify("Кому взятка? Например: /взятка Claude 500K", severity="warning")
+            return
+        base = self.cfg.get("limits", {}).get(name, {})
+        if how_much.strip():
+            parsed = parse_amount(how_much)
+            if not parsed:
+                self.notify("Не понял сумму: 500K, 1.5M, 20000 или $2", severity="error")
+                return
+            key, amount = parsed
+        else:
+            key = next((k for k in ("daily_tokens", "daily_cost_usd") if base.get(k)), "daily_tokens")
+            amount = base.get(key, 0) * BRIBE_SHARE
+        if not base.get(key):
+            self.notify(f"У {name} нет такого лимита в config.json — брать нечего 😉", severity="warning")
+            return
+        e = s.append({"kind": "bribe", "agent": name, "limit": key, "amount": amount,
+                      "total": self.limits_today()[name][key] + amount})
+        await self.add_to_feed(e)
+        self.update_usage()
+        if s.id not in self.running and s.meta.get("status") == "stopped":
+            self.notify("Лимит поднят. /continue — продолжить обсуждение")
+
+    def usage_report(self, s: Session) -> str:
+        today, here = self.store.usage_today(), usage_totals(s.events())
+        lines = ["### ⛽ Расход ИИ", "",
+                 "| | вызовов | токенов вход/выход | $ | время |", "|---|---|---|---|---|"]
+        for scope, data in (("заседание", here), ("сегодня", today)):
+            for name, _ in self._agents_info():
+                u = data.get(name, {})
+                lines.append(f"| {name} — {scope} | {u.get('calls', 0)} | {tokens(u.get('tokens_in', 0))} / "
+                             f"{tokens(u.get('tokens_out', 0))} | {u.get('cost_usd', 0):.2f} | "
+                             f"{u.get('seconds', 0) / 60:.1f} мин |")
+        lines += ["", "Считается только расход этого приложения. Остаток лимитов подписки Claude и Codex "
+                  "их CLI не сообщают. $ у Claude — цена по прейскуранту API (при подписке условная). "
+                  "Дневные лимиты задаются в `config.json`, раздел `limits`."]
+        return "\n".join(lines)
 
     def render_event(self, e: dict):
         k = e.get("kind")
@@ -340,19 +555,21 @@ class CouncilApp(App):
             return Markdown("\n\n".join(parts), classes="verdict-no")
         if k == "file":
             return Static(f"📎 прикреплено: {escape(e['text'])}", classes="sys")
+        if k == "bribe":
+            reaction = BRIBE_REACTIONS[int(e.get("ts", 0)) % len(BRIBE_REACTIONS)]
+            return Static(f"💰 Председатель дал взятку [b]{escape(e['agent'])}[/b]: "
+                          f"+{amount_text(e['limit'], e['amount'])} до конца дня "
+                          f"(лимит сегодня {amount_text(e['limit'], e['total'])}). "
+                          f"{escape(e['agent'])} {reaction}.", classes="bribe")
         return None
 
     def _agents_info(self):
-        return [(a.name, a.color) for a in build_agents(self.cfg, self.mock)]
+        return self.agent_info
 
     async def add_to_feed(self, e: dict):
         w = self.render_event(e)
         if w is not None:
-            feed = self.query_one("#feed", VerticalScroll)
-            at_bottom = feed.scroll_y >= feed.max_scroll_y - 2
-            await feed.mount(w)
-            if at_bottom:
-                feed.scroll_end(animate=False)
+            await self._mount_live(w)
 
     async def show_help(self):
         feed = self.query_one("#feed", VerticalScroll)
@@ -428,6 +645,10 @@ class CouncilApp(App):
         elif cmd == "/continue":
             n = int(arg) if arg.isdigit() else 3
             await self.continue_debate(s, n)
+        elif cmd == "/usage":
+            await self._mount_live(Markdown(self.usage_report(s), classes="sys"))
+        elif cmd in ("/взятка", "/bribe"):
+            await self.bribe(s, arg)
         elif cmd == "/export":
             path = self.export(s)
             self.notify(f"Протокол сохранён: {path}")
@@ -498,19 +719,50 @@ class CouncilApp(App):
     # ---------- обсуждение в фоне ----------
     def _emitter(self, s: Session):
         def emit(e):
+            if e.get("kind") == "progress":  # только для индикатора, в протокол не пишется
+                self.call_from_thread(self._on_progress, s.id, e)
+                return
             saved = s.append(e)
             self.call_from_thread(self._on_event, s.id, saved)
         return emit
 
+    def _on_progress(self, sid: str, e: dict):
+        self.progress.setdefault(sid, {})[e["agent"]] = {**e, "since": time.monotonic()}
+        self.refresh_progress()
+
+    def refresh_progress(self):
+        """Строка над вводом: что сейчас делает каждый ИИ (спиннер и таймер тикают сами)."""
+        w = getattr(self, "progress_bar", None)
+        if w is None:
+            return
+        s = self.current
+        states = self.progress.get(s.id) if s and s.id in self.running else None
+        w.display = bool(states)
+        if states:
+            w.update(progress_line([n for n, _ in self._agents_info()], states, time.monotonic()))
+
     async def _on_event(self, sid: str, e: dict):
         if self.current and self.current.id == sid:
+            if e.get("kind") == "reply" and e.get("egg"):
+                target = next((n for n, _ in self._agents_info() if n != e["agent"]), "оппонента")
+                await self._mount_live(EggThrow(e["agent"], target))
             await self.add_to_feed(e)
+            if e.get("kind") == "reply":
+                self.update_usage()
+
+    async def _mount_live(self, w):
+        feed = self.query_one("#feed", VerticalScroll)
+        at_bottom = feed.scroll_y >= feed.max_scroll_y - 2
+        await feed.mount(w)
+        if at_bottom:
+            feed.scroll_end(animate=False)
 
     async def start_debate(self, s: Session, question: str):
         e = s.append({"kind": "question", "text": question})
         await self.add_to_feed(e)
         d = Debate(build_agents(self.cfg, self.mock), s, question, self._emitter(s),
-                   max_rounds=s.meta.get("max_rounds", self.cfg["max_rounds"]))
+                   max_rounds=s.meta.get("max_rounds", self.cfg["max_rounds"]),
+                   budget_check=self.budget_check)
         await self._launch(s, d, lambda: d.run())
 
     async def continue_debate(self, s: Session, n: int):
@@ -519,7 +771,8 @@ class CouncilApp(App):
             return
         d = self.debates.get(s.id) or Debate.from_events(
             build_agents(self.cfg, self.mock), s, self._emitter(s),
-            max_rounds=s.meta.get("max_rounds", self.cfg["max_rounds"]))
+            max_rounds=s.meta.get("max_rounds", self.cfg["max_rounds"]),
+            budget_check=self.budget_check)
         if d is None:
             self.notify("Нечего продолжать — задайте вопрос", severity="warning")
             return
@@ -550,6 +803,8 @@ class CouncilApp(App):
 
     async def _finished(self, sid: str):
         self.running.discard(sid)
+        self.progress.pop(sid, None)
+        self.refresh_progress()
         await self.refresh_sidebar()
         self.update_header()
         s = next((x for x in self.sessions if x.id == sid), None)
@@ -575,6 +830,8 @@ class CouncilApp(App):
                 lines += [f"- ❓ {q}" for q in e["questions"]] + [""]
                 if e.get("proposed"):
                     lines += [f"> **Кандидат `{e['proposed']}`:** {e['proposal_text']}", ""]
+            elif k == "bribe":
+                lines += [f"💰 *Взятка {e['agent']}:* +{amount_text(e['limit'], e['amount'])} до конца дня", ""]
             elif k == "verdict":
                 lines += ["## " + ("✅ Консенсус" if e["consensus"] else "⚖️ Без консенсуса"), "",
                           e.get("answer", ""), ""]

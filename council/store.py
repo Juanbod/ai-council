@@ -7,6 +7,37 @@ import uuid
 from pathlib import Path
 
 
+USAGE_KEYS = ("tokens_in", "tokens_out", "cost_usd", "seconds", "calls")
+
+
+def usage_totals(events, since: float = 0.0) -> dict[str, dict]:
+    """Суммарный расход по участникам из реплик протокола (старые реплики без usage пропускаются)."""
+    out: dict[str, dict] = {}
+    for e in events:
+        u = e.get("usage")
+        if e.get("kind") != "reply" or not isinstance(u, dict) or e.get("ts", 0) < since:
+            continue
+        t = out.setdefault(e["agent"], dict.fromkeys(USAGE_KEYS, 0))
+        for k in USAGE_KEYS:
+            t[k] += u.get(k, 0)
+    return out
+
+
+def bribe_totals(events, since: float = 0.0) -> dict[str, dict]:
+    """Прибавки к дневным лимитам («взятки» председателя): {участник: {ключ лимита: сумма}}."""
+    out: dict[str, dict] = {}
+    for e in events:
+        if e.get("kind") == "bribe" and e.get("ts", 0) >= since:
+            t = out.setdefault(e["agent"], {})
+            t[e["limit"]] = t.get(e["limit"], 0) + e["amount"]
+    return out
+
+
+def start_of_today() -> float:
+    lt = time.localtime()
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
 class Session:
     def __init__(self, root: Path):
         self.root = root
@@ -126,3 +157,14 @@ class Store:
         with self._lock:
             self._sessions.pop(session.id, None)
         shutil.rmtree(session.root)
+
+    def usage_today(self) -> dict[str, dict]:
+        """Расход за сегодня (по местному времени) по всем заседаниям."""
+        return usage_totals(self._events_today(), start_of_today())
+
+    def bribes_today(self) -> dict[str, dict]:
+        """Взятки действуют до конца дня, в каком бы заседании их ни дали."""
+        return bribe_totals(self._events_today(), start_of_today())
+
+    def _events_today(self):
+        return [e for s in self.list() for e in s.events()]
