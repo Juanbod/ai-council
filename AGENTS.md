@@ -82,7 +82,7 @@
 | 7 Восстановление | `test_append_after_truncated_line_keeps_new_event`, `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
 | 8 Яйца | `test_egg_blocks_consensus_in_its_round`, `test_no_eggs_in_blind_round`, `test_eggs_run_out_and_consensus_follows`, `test_snapshot_shows_same_egg_stock_to_both`, `test_resume_keeps_egg_stock_and_reads_old_protocols`, `test_eggs_shown_in_feed_and_export` | соразмерно ли настоящие модели используют яйца — только живым прогоном |
 | Расход / лимиты | `test_reply_usage_counts_failed_attempts_too`, `test_budget_check_pauses_before_round`, `test_usage_totals_skips_old_and_earlier_events`, `test_codex_reports_usage_from_json_events`, `test_claude_reports_usage_and_cost`, `test_usage_indicator_and_daily_limit`, `test_parse_bribe_amount`, `test_bribes_count_only_today`, `test_bribe_raises_limit_and_debate_continues`, `test_old_config_gets_limits_section` | остаток лимитов подписки недоступен из CLI |
-| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs`, `test_progress_line_states`, `test_progress_bar_shows_while_running_and_is_not_saved`, `test_progress_events_per_agent`, `test_progress_reports_failure`, `test_stop_button_stops_debate` | как анимация выглядит в разных терминалах — вручную |
+| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs`, `test_progress_line_states`, `test_progress_bar_shows_while_running_and_is_not_saved`, `test_progress_events_per_agent`, `test_progress_reports_failure`, `test_stop_button_stops_debate`, `test_copy_button_copies_message_text` | как анимация выглядит в разных терминалах — вручную |
 | meta / Session / вложения | `test_meta_updates_from_stale_instance_do_not_revert`, `test_store_returns_one_instance_per_id`, `test_rename_after_debate_keeps_status`, `test_attach_project_folder_skips_sessions`, `test_attach_sessions_folder_is_refused` | — |
 
 Регрессионные тесты проверены: при откате соответствующих исправлений они падают.
@@ -116,7 +116,7 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 68 passed (на момент 2026-11-03)
+python -m pytest -q tests          # должно быть: 69 passed (на момент 2026-11-03)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
@@ -198,3 +198,6 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
   процессов (`taskkill /T`: `.cmd`-обёртка оставляла `node` живым, и `communicate()` висел); запись в протокол
   после оборванной строки начинается с новой строки, чтение не падает на битом UTF-8; прикрепление папки, внутри
   которой лежит `sessions/`, её пропускает, а саму папку заседаний прикрепить нельзя.
+- 2026-11-03 — Кнопка «⧉» копирования у сообщений ленты: копируется исходный текст (у вердикта — только итоговый
+  ответ), а не отрисовка. Кроме `copy_to_clipboard` (OSC 52, понимают не все терминалы) — запись в буфер Windows
+  через WinAPI (`ctypes`, без новых зависимостей).
