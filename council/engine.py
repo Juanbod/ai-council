@@ -151,7 +151,10 @@ class Debate:
         """Общее состояние раунда: читается с диска один раз и одинаково для обоих участников.
         Изменения председателя (тема, вложения) попадут только в следующий снимок."""
         files = self.session.files()
-        said = [self.question, self.session.topic] + [n["text"] for n in self.notes]
+        # путь, однажды названный в заседании, остаётся открытым и для следующих вопросов
+        said = [self.session.topic] + [e["text"] for e in self.session.events()
+                                       if e.get("kind") in ("question", "chair")]
+        said += [self.question] + [n["text"] for n in self.notes]
         linked = list(dict.fromkeys(p for t in said for p in find_paths(t)))
         shared = {
             "round": self.round, "max_rounds": self.max_rounds,

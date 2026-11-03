@@ -413,3 +413,24 @@ def test_progress_reports_failure(session):
     Debate([Broken("Claude"), MockAgent("Codex")], session, "q", events.append, max_rounds=0).run()
     assert [e["state"] for e in events if e["kind"] == "progress" and e["agent"] == "Claude"] == \
         ["thinking", "retry", "failed"]
+
+
+def test_path_from_earlier_question_stays_linked(session, tmp_path):
+    """Регрессия: второй вопрос без пути («пересмотрите проект») снова оставлял Claude без доступа."""
+    proj = tmp_path / "Fuji-XE2-Research"
+    proj.mkdir()
+    run(session, MockAgent("Claude", "stubborn"), MockAgent("Codex", "agree"))  # вопрос без пути
+    session.append({"kind": "question", "text": f"изучите проект: {proj}"})
+    session.append({"kind": "chair", "text": "без пути"})
+    seen = []
+
+    class Spy(MockAgent):
+        def ask(self, prompt, workdir, attachments, cancel=None):
+            seen.append((json.loads(prompt.rsplit("<<STATE>>", 1)[1])["linked_paths"], list(attachments)))
+            return super().ask(prompt, workdir, attachments, cancel)
+
+    q = "доступ предоставлен, пересмотрите проект"
+    session.append({"kind": "question", "text": q})
+    Debate([Spy("Claude", "stubborn"), Spy("Codex", "agree")], session, q, session.append,
+           max_rounds=0).run()
+    assert seen and all(s == ([str(proj)], [proj]) for s in seen)

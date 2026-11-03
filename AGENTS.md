@@ -29,7 +29,8 @@
 2. **Симметрия.** Состояние раунда (тема, список вложений, протокол, кандидаты) читается **один раз**
    (`Debate._snapshot`) и одинаково для обоих; вызовы параллельны; ответы добавляются в протокол только после
    завершения *обоих*. Изменения председателя во время раунда попадают в следующий снимок.
-   Абсолютные пути, которые председатель написал в вопросе, теме или реплике (`find_paths`), попадают в снимок
+   Абсолютные пути, которые председатель написал в теме или в любом вопросе/реплике заседания (`find_paths`;
+   однажды названный путь остаётся открытым для следующих вопросов), попадают в снимок
    как `linked_paths` и во вложения обоих: Codex читает их сам, Claude получает `--add-dir` (без него
    Claude в `-p` получает отказ вне рабочей папки — так и случилось в заседании про Fuji X-E2).
 3. **Консенсус = один id.** Кандидаты неизменяемы, `id = sha256(text)[:8]`. Консенсус — только если оба в одном
@@ -66,7 +67,7 @@
 |---|---|---|
 | 1 Слепой раунд 0 | `test_symmetric_snapshot` | — |
 | 2 Симметрия | `test_session_state_is_read_once_per_round`, `test_snapshot_is_shared_even_if_session_changes_mid_round`, `test_parallel_calls` | содержимое уже прикреплённых файлов агенты читают с диска «вживую» |
-| 2 Пути из текста | `test_find_paths_in_chair_text`, `test_linked_paths_reach_both_agents_and_claude_gets_add_dir`, `test_claude_gets_add_dir_for_outside_paths` | пути без кавычек с пробелами обрезаются по пробелу — такие нужно брать в кавычки |
+| 2 Пути из текста | `test_find_paths_in_chair_text`, `test_linked_paths_reach_both_agents_and_claude_gets_add_dir`, `test_claude_gets_add_dir_for_outside_paths`, `test_path_from_earlier_question_stays_linked` | пути без кавычек с пробелами обрезаются по пробелу — такие нужно брать в кавычки |
 | 3 Консенсус по id | `test_two_accepts_of_different_ids_are_not_consensus`, `test_accept_of_id_proposed_in_same_round_is_not_consensus` | — |
 | 4 Сбой ≠ согласие | `test_flaky_agent_is_retried`, `test_two_failures_count_as_reject` | — |
 | 5 Только чтение | `test_claude_is_read_only_and_uses_stdin`, `test_codex_is_read_only_and_uses_stdin` (флаги) | фактическое соблюдение ограничений самими CLI не проверяется; у Claude это запрет инструментов, не песочница ОС |
@@ -103,7 +104,7 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 55 passed (на момент 2026-11-03)
+python -m pytest -q tests          # должно быть: 56 passed (на момент 2026-11-03)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
