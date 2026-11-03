@@ -359,3 +359,57 @@ def test_usage_totals_skips_old_and_earlier_events():
     assert usage_totals(events)["Claude"]["tokens_in"] == 17
     today = usage_totals(events, since=10)
     assert today == {"Claude": {"tokens_in": 7, "tokens_out": 0, "cost_usd": 0.5, "seconds": 0, "calls": 1}}
+
+
+# ---------- пути из текста председателя ----------
+
+def test_find_paths_in_chair_text(tmp_path):
+    from council.engine import find_paths
+    proj = tmp_path / "Fuji-XE2-Research"
+    proj.mkdir()
+    spaced = tmp_path / "с пробелом.txt"
+    spaced.write_text("x", encoding="utf-8")
+    text = f'вот путь к проекту: {proj}, и ещё "{spaced}". А этого нет: {tmp_path / "nope"}'
+    assert find_paths(text) == [proj, spaced]
+
+
+def test_linked_paths_reach_both_agents_and_claude_gets_add_dir(session, tmp_path):
+    """Регрессия: путь, указанный в вопросе, Codex читал, а Claude получал отказ в доступе."""
+    proj = tmp_path / "project"
+    proj.mkdir()
+    seen = {}
+
+    class Spy(MockAgent):
+        def ask(self, prompt, workdir, attachments, cancel=None):
+            st = json.loads(prompt.rsplit("<<STATE>>", 1)[1])
+            seen[self.name] = (st["linked_paths"], list(attachments))
+            return super().ask(prompt, workdir, attachments, cancel)
+
+    q = f"изучите проект: {proj}"
+    session.append({"kind": "question", "text": q})
+    Debate([Spy("Claude", "stubborn"), Spy("Codex", "agree")], session, q, session.append,
+           max_rounds=1).run()
+    assert seen["Claude"] == seen["Codex"] == ([str(proj)], [proj])
+
+
+def test_progress_events_per_agent(session):
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    Debate([MockAgent("Claude", "stubborn"), MockAgent("Codex", "flaky")], session, "q",
+           events.append, max_rounds=1).run()
+    states = lambda name, rnd: [e["state"] for e in events
+                                if e["kind"] == "progress" and e["agent"] == name and e["round"] == rnd]
+    assert states("Claude", 0) == ["thinking", "done"]
+    assert states("Codex", 0) == ["thinking", "retry", "done"]  # первый ответ flaky — битый
+
+
+def test_progress_reports_failure(session):
+    class Broken(MockAgent):
+        def ask(self, *a, **k):
+            return "не json"
+
+    events = []
+    session.append({"kind": "question", "text": "q"})
+    Debate([Broken("Claude"), MockAgent("Codex")], session, "q", events.append, max_rounds=0).run()
+    assert [e["state"] for e in events if e["kind"] == "progress" and e["agent"] == "Claude"] == \
+        ["thinking", "retry", "failed"]

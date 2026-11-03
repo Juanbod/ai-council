@@ -131,6 +131,18 @@ def codex_events(out: str) -> tuple[dict | None, str]:
     return found, text
 
 
+def outside_dirs(attachments: list[Path], workdir: Path) -> list[Path]:
+    """Каталоги вложений вне рабочей папки (для файла — его папка)."""
+    root = Path(workdir).resolve()
+    out: list[Path] = []
+    for a in attachments:
+        d = Path(a).resolve()
+        d = d if d.is_dir() else d.parent
+        if not d.is_relative_to(root) and d not in out:
+            out.append(d)
+    return out
+
+
 class Agent:
     name = "Agent"
     color = "white"
@@ -155,6 +167,9 @@ class ClaudeAgent(Agent):
                "--disallowedTools", "Edit,Write,NotebookEdit,Bash,WebFetch"]
         if self.model:
             cmd += ["--model", self.model]
+        # без --add-dir Claude в режиме -p не может читать вне рабочей папки (Codex с read-only — может)
+        for d in outside_dirs(attachments, workdir):
+            cmd += ["--add-dir", str(d)]
         if self.use_json_schema:
             cmd += ["--json-schema", json.dumps(SCHEMA)]
         cmd += self.extra_args
@@ -224,7 +239,8 @@ class MockAgent(Agent):
         self.last_usage = usage(len(prompt) // 4, 50)  # грубая оценка: ~4 символа на токен
         if self.behavior == "flaky" and self.calls == 1:
             return "извините, вот {сломанный: json"
-        ctx = json.loads(prompt.rsplit("<<STATE>>", 1)[1])
+        # после состояния может идти замечание модератора (повторная попытка) — читаем только JSON
+        ctx, _ = json.JSONDecoder().raw_decode(prompt.rsplit("<<STATE>>", 1)[1].lstrip())
         cands = ctx["candidates"]
         theirs = [c for c in cands if c["author"] != self.name]
         mine = [c for c in cands if c["author"] == self.name]

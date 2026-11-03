@@ -138,6 +138,29 @@ def usage_line(names: list[str], today: dict, limits: dict) -> str:
     return "⛽ сегодня: " + "  │  ".join(parts)
 
 
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def progress_line(names: list[str], states: dict, now: float) -> str:
+    rnd = next(iter(states.values()))["round"]
+    head = "Независимый анализ" if rnd == 0 else f"Раунд {rnd}"
+    parts = []
+    for name in names:
+        st, who = states.get(name), f"[b]{escape(name)}[/b]"
+        if not st:
+            parts.append(f"· {who} ждёт")
+            continue
+        elapsed = now - st["since"]
+        spin = SPINNER[int(now * 8) % len(SPINNER)]
+        parts.append({
+            "thinking": f"{spin} {who} думает… {elapsed:.0f} с",
+            "retry": f"{spin} {who} переделывает ответ (не по схеме)… {elapsed:.0f} с",
+            "done": f"[green]✓[/green] {who} ответил за {st['seconds']:.0f} с",
+            "failed": f"[red]✗[/red] {who} — сбой, засчитан REJECT",
+        }.get(st["state"], who))
+    return f"[dim]{head}:[/dim]  " + "   │   ".join(parts)
+
+
 def egg_score(verdict: dict) -> str:
     """Счёт брошенных яиц для вердикта; пусто, если обошлось без яиц (или протокол старый)."""
     eggs = verdict.get("eggs") or {}
@@ -276,6 +299,7 @@ class CouncilApp(App):
     #usage { padding: 0 1; height: auto; }
     #feed { height: 1fr; padding: 0 1; }
     #input { dock: bottom; }
+    #progress { height: auto; padding: 0 1; background: $boost; display: none; }
     .chair { background: $primary 15%; border-left: thick $primary; padding: 0 1; margin: 1 0 0 0; }
     .round { color: $text-muted; text-style: bold; margin: 1 0 0 0; text-align: center; }
     .reply { border-left: thick $panel; padding: 0 1; margin: 1 0 0 0; }
@@ -311,6 +335,9 @@ class CouncilApp(App):
         self.current: Session | None = None
         self.debates: dict[str, Debate] = {}
         self.running: set[str] = set()
+        # состояние участников текущего раунда: {sid: {агент: событие progress + since}}
+        self.progress: dict[str, dict[str, dict]] = {}
+        self.agent_info = [(a.name, a.color) for a in build_agents(self.cfg, self.mock)]
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -323,6 +350,7 @@ class CouncilApp(App):
                 yield Static("", id="filesbar")
                 yield Static("", id="usage")
                 yield VerticalScroll(id="feed")
+                yield Static("", id="progress")
                 yield Input(placeholder="Вопрос совету, /команда или путь к файлу…  (F1 — справка)",
                             id="input")
         yield Footer()
@@ -339,6 +367,9 @@ class CouncilApp(App):
         else:
             await self.show_help()
         self.query_one("#input", Input).focus()
+        # ссылка, а не query_one: таймер тикает и когда сверху модальное окно (там #progress не найти)
+        self.progress_bar = self.query_one("#progress", Static)
+        self.set_interval(0.25, self.refresh_progress)
 
     # ---------- боковая панель ----------
     async def refresh_sidebar(self):
@@ -533,7 +564,7 @@ class CouncilApp(App):
         return None
 
     def _agents_info(self):
-        return [(a.name, a.color) for a in build_agents(self.cfg, self.mock)]
+        return self.agent_info
 
     async def add_to_feed(self, e: dict):
         w = self.render_event(e)
@@ -688,9 +719,27 @@ class CouncilApp(App):
     # ---------- обсуждение в фоне ----------
     def _emitter(self, s: Session):
         def emit(e):
+            if e.get("kind") == "progress":  # только для индикатора, в протокол не пишется
+                self.call_from_thread(self._on_progress, s.id, e)
+                return
             saved = s.append(e)
             self.call_from_thread(self._on_event, s.id, saved)
         return emit
+
+    def _on_progress(self, sid: str, e: dict):
+        self.progress.setdefault(sid, {})[e["agent"]] = {**e, "since": time.monotonic()}
+        self.refresh_progress()
+
+    def refresh_progress(self):
+        """Строка над вводом: что сейчас делает каждый ИИ (спиннер и таймер тикают сами)."""
+        w = getattr(self, "progress_bar", None)
+        if w is None:
+            return
+        s = self.current
+        states = self.progress.get(s.id) if s and s.id in self.running else None
+        w.display = bool(states)
+        if states:
+            w.update(progress_line([n for n, _ in self._agents_info()], states, time.monotonic()))
 
     async def _on_event(self, sid: str, e: dict):
         if self.current and self.current.id == sid:
@@ -754,6 +803,8 @@ class CouncilApp(App):
 
     async def _finished(self, sid: str):
         self.running.discard(sid)
+        self.progress.pop(sid, None)
+        self.refresh_progress()
         await self.refresh_sidebar()
         self.update_header()
         s = next((x for x in self.sessions if x.id == sid), None)

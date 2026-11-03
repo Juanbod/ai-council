@@ -98,3 +98,15 @@ def test_claude_reports_usage_and_cost(monkeypatch, tmp_path):
     ag = ClaudeAgent()
     ag.ask("p", tmp_path, [])
     assert ag.last_usage == {"tokens_in": 30947, "tokens_out": 4, "cost_usd": 0.25}
+
+
+def test_claude_gets_add_dir_for_outside_paths(captured, tmp_path):
+    workdir, outside = tmp_path / "session", tmp_path / "project"
+    (workdir / "files").mkdir(parents=True)
+    outside.mkdir()
+    inner = workdir / "files" / "a.txt"
+    inner.write_text("x")
+    ClaudeAgent().ask("p", workdir, [inner, outside, outside / "b.txt"])
+    cmd = captured[0]["cmd"]
+    dirs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--add-dir"]
+    assert dirs == [str(outside.resolve())]  # вложения внутри рабочей папки доступны и так

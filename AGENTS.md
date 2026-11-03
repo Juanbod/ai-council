@@ -29,6 +29,9 @@
 2. **Симметрия.** Состояние раунда (тема, список вложений, протокол, кандидаты) читается **один раз**
    (`Debate._snapshot`) и одинаково для обоих; вызовы параллельны; ответы добавляются в протокол только после
    завершения *обоих*. Изменения председателя во время раунда попадают в следующий снимок.
+   Абсолютные пути, которые председатель написал в вопросе, теме или реплике (`find_paths`), попадают в снимок
+   как `linked_paths` и во вложения обоих: Codex читает их сам, Claude получает `--add-dir` (без него
+   Claude в `-p` получает отказ вне рабочей папки — так и случилось в заседании про Fuji X-E2).
 3. **Консенсус = один id.** Кандидаты неизменяемы, `id = sha256(text)[:8]`. Консенсус — только если оба в одном
    раунде (≥ 1) проголосовали `ACCEPT` за один и тот же id, уже существовавший до этого раунда,
    и в этом раунде не летело ни одного яйца (см. ниже).
@@ -63,6 +66,7 @@
 |---|---|---|
 | 1 Слепой раунд 0 | `test_symmetric_snapshot` | — |
 | 2 Симметрия | `test_session_state_is_read_once_per_round`, `test_snapshot_is_shared_even_if_session_changes_mid_round`, `test_parallel_calls` | содержимое уже прикреплённых файлов агенты читают с диска «вживую» |
+| 2 Пути из текста | `test_find_paths_in_chair_text`, `test_linked_paths_reach_both_agents_and_claude_gets_add_dir`, `test_claude_gets_add_dir_for_outside_paths` | пути без кавычек с пробелами обрезаются по пробелу — такие нужно брать в кавычки |
 | 3 Консенсус по id | `test_two_accepts_of_different_ids_are_not_consensus`, `test_accept_of_id_proposed_in_same_round_is_not_consensus` | — |
 | 4 Сбой ≠ согласие | `test_flaky_agent_is_retried`, `test_two_failures_count_as_reject` | — |
 | 5 Только чтение | `test_claude_is_read_only_and_uses_stdin`, `test_codex_is_read_only_and_uses_stdin` (флаги) | фактическое соблюдение ограничений самими CLI не проверяется; у Claude это запрет инструментов, не песочница ОС |
@@ -70,7 +74,7 @@
 | 7 Восстановление | `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
 | 8 Яйца | `test_egg_blocks_consensus_in_its_round`, `test_no_eggs_in_blind_round`, `test_eggs_run_out_and_consensus_follows`, `test_snapshot_shows_same_egg_stock_to_both`, `test_resume_keeps_egg_stock_and_reads_old_protocols`, `test_eggs_shown_in_feed_and_export` | соразмерно ли настоящие модели используют яйца — только живым прогоном |
 | Расход / лимиты | `test_reply_usage_counts_failed_attempts_too`, `test_budget_check_pauses_before_round`, `test_usage_totals_skips_old_and_earlier_events`, `test_codex_reports_usage_from_json_events`, `test_claude_reports_usage_and_cost`, `test_usage_indicator_and_daily_limit`, `test_parse_bribe_amount`, `test_bribes_count_only_today`, `test_bribe_raises_limit_and_debate_continues`, `test_old_config_gets_limits_section` | остаток лимитов подписки недоступен из CLI |
-| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs` | как анимация выглядит в разных терминалах — вручную |
+| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs`, `test_progress_line_states`, `test_progress_bar_shows_while_running_and_is_not_saved`, `test_progress_events_per_agent`, `test_progress_reports_failure` | как анимация выглядит в разных терминалах — вручную |
 | meta / Session | `test_meta_updates_from_stale_instance_do_not_revert`, `test_store_returns_one_instance_per_id`, `test_rename_after_debate_keeps_status` | — |
 
 Регрессионные тесты проверены: при откате соответствующих исправлений они падают.
@@ -88,6 +92,8 @@
   `--disallowedTools`, `--model` есть. В JSON есть `usage` (вход, `cache_creation_input_tokens`,
   `cache_read_input_tokens`, выход) и `total_cost_usd` (цена по прейскуранту API). Даже пустой вызов стоит
   ~30К входных токенов — это системный промпт Claude Code.
+  Вне рабочей папки Claude в `-p` читать не может (`permission_denials`); `--add-dir <папка>` это разрешает и
+  совместим с `--json-schema` (проверено 2026-11-03).
 - `codex exec --json` печатает JSONL; расход — в событии `turn.completed` (`usage.input_tokens`, `output_tokens`),
   совместим с `--output-schema` и `-o` (проверено 2026-11-03). Стоимости и остатка лимитов в выводе нет.
 - Ни один CLI не сообщает остаток лимитов подписки неинтерактивно (только `/usage`/`/status` в их TUI).
@@ -97,7 +103,7 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 48 passed (на момент 2026-11-03)
+python -m pytest -q tests          # должно быть: 55 passed (на момент 2026-11-03)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
@@ -129,13 +135,12 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - **Угодливость**: участники могут соглашаться слишком быстро. Идеи: запрет `ACCEPT` в раунде 1,
   роль «адвоката дьявола», требование явного аргумента для уступки.
 - **Рост контекста**: раунды старше двух последних сжимаются обрезкой (`_compact_log`), а не настоящим резюме.
-- **Нет прогресса внутри вызова**: пока агент думает (десятки секунд), лента не обновляется; можно перейти на
-  `--output-format stream-json` / `codex exec --json`.
+- **Прогресс внутри вызова** — только «думает N с» (событие `progress`, в протокол не пишется). Что именно
+  агент делает (какие файлы читает) — можно показать через `--output-format stream-json` / события `codex exec --json`.
 - **Остаток лимитов подписки** неизвестен: учитывается только расход приложения (`/usage`, `limits`).
 - **Накладные расходы Claude**: ~30К токенов системного промпта на каждый вызов. Можно попробовать
   урезанный системный промпт или повторное использование сессии — нужно проверить, что не ломается изоляция.
 - Поле `rounds` в вердикте без консенсуса равно `max_rounds + 1` (номер следующего раунда) — стоит уточнить семантику.
-- `CouncilApp._agents_info` пересоздаёт агентов при каждой отрисовке реплики — мелкая неэффективность.
 - Изображения передаются явно только Codex (`-i`); Claude читает их сам инструментом Read.
 - Протокол рассчитан ровно на двух участников.
 - Изоляция Claude держится на запрете инструментов, а не на песочнице ОС.
@@ -164,3 +169,6 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - 2026-11-03 — «Взятка» (идея председателя) поднимает дневной лимит только до полуночи и хранится событием в
   протоколе, а не правкой `config.json`: постоянный лимит остаётся осознанной настройкой, а разовые прибавки видны
   в истории. Взятка к безлимитному участнику не принимается — она ничего бы не изменила.
+- 2026-11-03 — Пути из текста председателя открываются обоим (симметрия): `--add-dir` для Claude вместо копирования
+  папки в `files/` — проекты бывают большими, а агенты всё равно только читают.
+- 2026-11-03 — Индикатор обработки — transient-события `progress`: в `events.jsonl` не пишутся, протокол не засоряют.

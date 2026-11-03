@@ -249,3 +249,31 @@ async def test_bribe_raises_limit_and_debate_continues(app):
         assert s.meta["status"] == "consensus"
         await type_and_send(pilot, "/export")
         assert "Взятка Claude" in (s.root / "protocol.md").read_text(encoding="utf-8")
+
+
+def test_progress_line_states():
+    from council.app import progress_line
+    states = {"Claude": {"state": "thinking", "round": 1, "since": 100.0, "seconds": 0},
+              "Codex": {"state": "done", "round": 1, "since": 90.0, "seconds": 8.4}}
+    line = progress_line(["Claude", "Codex"], states, now=112.0)
+    assert "Раунд 1" in line and "Claude[/b] думает… 12 с" in line and "Codex[/b] ответил за 8 с" in line
+    assert "ждёт" in progress_line(["Claude", "Codex"], {"Claude": states["Claude"]}, now=100.0)
+
+
+@pytest.mark.asyncio
+async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatch):
+    monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [
+        MockAgent("Claude", "stubborn", delay=0.6), MockAgent("Codex", "agree", delay=0.1)])
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Индикатор")
+        s = app.current
+        await type_and_send(pilot, "вопрос")
+        await asyncio.sleep(0.35)
+        await pilot.pause()
+        bar = app.query_one("#progress")
+        text = str(bar.render())
+        assert bar.display and "Claude" in text and "думает" in text and "ответил" in text
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        assert not bar.display
+        assert not any(e["kind"] == "progress" for e in s.events())
