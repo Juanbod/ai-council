@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -45,13 +46,28 @@ def resolve_exe(name_or_path: str) -> str:
     raise AgentError(f"не найден исполняемый файл: {name_or_path}")
 
 
+def kill_tree(proc: subprocess.Popen):
+    """claude/codex — обёртки .cmd, настоящий node — их дочерний процесс. proc.kill() убил бы только
+    cmd.exe, а node продолжил бы работу и держал каналы вывода, так что communicate() завис бы."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.kill()
+    proc.communicate(timeout=30)
+
+
 def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
             cancel: threading.Event | None = None) -> str:
     """Запуск без shell=True, промпт через stdin (обходит лимит длины командной строки Windows)."""
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", creationflags=flags)
+                            errors="replace", creationflags=flags, start_new_session=os.name != "nt")
     deadline = time.monotonic() + timeout
     pending_input = prompt
     while True:
@@ -61,12 +77,10 @@ def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
         except subprocess.TimeoutExpired:
             pending_input = None  # stdin уже передан
             if cancel is not None and cancel.is_set():
-                proc.kill()
-                proc.communicate()
+                kill_tree(proc)
                 raise Cancelled()
             if time.monotonic() > deadline:
-                proc.kill()
-                proc.communicate()
+                kill_tree(proc)
                 raise AgentError(f"таймаут {timeout} с")
     if proc.returncode != 0:
         tail = (err or out or "").strip()[-800:]
@@ -164,9 +178,12 @@ class ClaudeAgent(Agent):
 
     def ask(self, prompt, workdir, attachments, cancel=None):
         self.last_usage = None
-        # только чтение: инструменты записи и выполнения команд запрещены всегда, веб — без /web
+        # только чтение: белый список встроенных инструментов (без MCP, плагинов, субагентов);
+        # запрет записи и команд — вторым слоем, веб — только с /web
+        tools = "Read,Glob,Grep" + (",WebFetch,WebSearch" if self.web else "")
         denied = "Edit,Write,NotebookEdit,Bash" + ("" if self.web else ",WebFetch,WebSearch")
-        cmd = [resolve_exe(self.exe), "-p", "--output-format", "json", "--disallowedTools", denied]
+        cmd = [resolve_exe(self.exe), "-p", "--output-format", "json", "--tools", tools,
+               "--disallowedTools", denied, "--strict-mcp-config", "--no-session-persistence"]
         if self.web:  # в режиме -p без явного разрешения WebFetch получает отказ
             cmd += ["--allowedTools", "WebFetch,WebSearch"]
         if self.model:

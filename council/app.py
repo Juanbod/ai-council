@@ -1,5 +1,6 @@
 """Терминальный интерфейс совета: заседания слева, протокол справа, строка ввода снизу."""
 import argparse
+import asyncio
 import json
 import os
 import shlex
@@ -728,8 +729,9 @@ class CouncilApp(App):
             self.notify("Сначала создайте заседание", severity="warning")
             return
         try:
-            dest = self.current.attach(path)
-        except OSError as ex:
+            # большая папка копируется долго — не в потоке интерфейса
+            dest = await asyncio.to_thread(self.current.attach, path)
+        except (OSError, ValueError) as ex:
             self.notify(f"Не удалось прикрепить: {ex}", severity="error")
             return
         e = self.current.append({"kind": "file", "text": f"{path} → files/{dest.name}"})

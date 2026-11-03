@@ -1,6 +1,8 @@
 """Хранение заседаний: каждое — папка с meta.json, events.jsonl и files/."""
 import json
+import os
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -57,6 +59,15 @@ class Session:
     def topic(self) -> str:
         return self.meta.get("topic", "")
 
+    @property
+    def workdir(self) -> Path:
+        """Пустая рабочая папка участников — вне проекта и вне папки заседания: иначе они видят
+        events.jsonl/meta.json (расход, переигранный ответ оппонента) и подхватывают AGENTS.md/CLAUDE.md
+        репозитория, в котором лежит sessions/. Вложения передаются им абсолютными путями."""
+        d = Path(tempfile.gettempdir()) / "ai-council" / self.id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def set(self, **fields):
         """Чтение-изменение-запись под замком: меняются только переданные поля, остальные
         берутся с диска, поэтому устаревшая копия meta не затрёт чужие изменения."""
@@ -72,9 +83,15 @@ class Session:
     # --- события (протокол заседания) ---
     def append(self, event: dict) -> dict:
         event = {"ts": time.time(), **event}
+        line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
         with self._lock:
-            with open(self.root / "events.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            with open(self.root / "events.jsonl", "a+b") as f:
+                # после аварии последняя строка может быть оборвана — иначе новое событие склеится с ней
+                if f.seek(0, os.SEEK_END):
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        line = b"\n" + line
+                f.write(line)
         return event
 
     def events(self) -> list[dict]:
@@ -82,7 +99,8 @@ class Session:
         if not path.exists():
             return []
         out = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # обрыв посреди многобайтного символа не должен ронять чтение всего протокола
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.strip():
                 try:
                     out.append(json.loads(line))
@@ -102,8 +120,15 @@ class Session:
             dest = self.files_dir / f"{src.stem}_{n}{src.suffix}"
             n += 1
         if src.is_dir():
-            shutil.copytree(src, dest, ignore=shutil.ignore_patterns(
-                ".git", "node_modules", "__pycache__", ".venv", "venv"))
+            sessions_root = self.root.parent.resolve()
+            if self.files_dir.resolve().is_relative_to(src) and src.is_relative_to(sessions_root):
+                raise ValueError("нельзя прикрепить папку заседаний или её часть")
+            skip = shutil.ignore_patterns(".git", "node_modules", "__pycache__", ".venv", "venv")
+
+            def ignore(d, names):
+                # папка заседаний внутри вложения (например, весь проект): иначе копия копирует саму себя
+                return set(skip(d, names)) | {n for n in names if Path(d, n).resolve() == sessions_root}
+            shutil.copytree(src, dest, ignore=ignore)
         else:
             shutil.copy2(src, dest)
         return dest
