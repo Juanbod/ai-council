@@ -337,6 +337,24 @@ async def test_copy_button_copies_message_text(app, monkeypatch):
         verdict = [e for e in s.events() if e["kind"] == "verdict"][-1]
         assert await copy(messages[-1]) == verdict["answer"]  # из вердикта — только итоговый ответ
         reply = next(m for m in messages if "reply" in m.classes)
-        assert (await copy(reply)).startswith("**Claude** · раунд 0")
+        assert (await copy(reply)).startswith("**Claude** (")  # с ролью: Скептик или Конструктор
         if app_mod.os.name == "nt":
             assert copied == [messages[0].text, verdict["answer"], reply.text]
+
+
+@pytest.mark.asyncio
+async def test_app_debate_has_roles_and_critique_round(app):
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Без поддакивания")
+        s = app.current
+        await type_and_send(pilot, "Монолит или микросервисы?")
+        await wait_idle(pilot, s.id)
+        await pilot.pause()
+        events = s.events()
+        verdict = [e for e in events if e["kind"] == "verdict"][-1]
+        assert verdict["consensus"] and verdict["rounds"] == 2  # в раунде 1 — только критика
+        assert sorted(verdict["roles"].values()) == ["Конструктор", "Скептик"]
+        feed = "\n".join(m.text for m in app.query(app_mod.Message))
+        assert "(Скептик)" in feed and "(Конструктор)" in feed and "**Убедило:**" in feed
+        await type_and_send(pilot, "/export")
+        assert "*Убедило:*" in (s.root / "protocol.md").read_text(encoding="utf-8")

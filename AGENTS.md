@@ -34,11 +34,12 @@
    как `linked_paths` и во вложения обоих: Codex читает их сам, Claude получает `--add-dir` (без него
    Claude в `-p` получает отказ вне рабочей папки — так и случилось в заседании про Fuji X-E2).
 3. **Консенсус = один id.** Кандидаты неизменяемы, `id = sha256(text)[:8]`. Консенсус — только если оба в одном
-   раунде (≥ 1) проголосовали `ACCEPT` за один и тот же id, уже существовавший до этого раунда,
-   и в этом раунде не летело ни одного яйца (см. ниже).
+   раунде (≥ `min_consensus_round`, в приложении 2) проголосовали `ACCEPT` за один и тот же id, уже существовавший
+   до этого раунда, и в этом раунде не летело ни одного яйца (см. ниже).
 4. **Сбой ≠ согласие.** Невалидный JSON → один повтор с текстом ошибки; повторный сбой → голос `REJECT`.
-5. **Только чтение и изоляция.** Агенты не изменяют файлы и не выполняют команды: Codex `--sandbox read-only`,
-   Claude — белый список `--tools Read,Glob,Grep` плюс запрет `--disallowedTools Edit,Write,NotebookEdit,Bash`,
+5. **Только чтение и изоляция.** Агенты не изменяют файлы. Codex `--sandbox read-only`: команды PowerShell он
+   выполняет (так он читает файлы), но запись на диск песочница запрещает (проверено 2026-11-03). Claude команд не
+   выполняет вовсе — белый список `--tools Read,Glob,Grep` плюс запрет `--disallowedTools Edit,Write,NotebookEdit,Bash`,
    `--strict-mcp-config` (без MCP), `--no-session-persistence` — **всегда**. Интернет по умолчанию выключен (Claude ещё и
    `WebFetch,WebSearch` в запрете, Codex без `--search`). `/web on` включает его в заседании (`meta.web`) обоим
    сразу из одного снимка: Claude `--allowedTools WebFetch,WebSearch`, Codex `codex --search exec …`.
@@ -58,6 +59,12 @@
    `/stop` и перезапуск. Яйцо в раунде 0 или сверх запаса не засчитывается (предупреждение). Яйцо может
    только **помешать** консенсусу, но никогда не создаёт его. Запас виден обоим в снимке (`eggs_left`).
    Протоколы без поля `egg` читаются как «яиц не было».
+9. **Без угодливости.** Участники — представители разных взглядов (`ROLES`: Скептик и Конструктор; распределение
+   по хешу вопроса — то же после `/continue`, между вопросами чередуется; роли видны обоим в снимке).
+   `ACCEPT` за **чужой** вариант засчитывается только с непустым `convinced_by` (какой довод убедил) — иначе
+   модератор меняет голос на `REJECT`. Раунды до `min_consensus_round` — раунды критики: согласие в них не
+   засчитывается (требование сдвигается к последнему раунду, если раундов меньше). В последнем раунде промпт
+   просит синтез или честное «консенсуса нет». Протоколы без `convinced_by` читаются как пустое поле.
 
 Расход и лимиты: каждый ответ в `events.jsonl` несёт `usage` (токены вход/выход, $, время, число вызовов, включая
 неудачные попытки). В `Debate.log` и снимок расход **не попадает** — участники его не видят. Лимиты проверяются
@@ -80,6 +87,7 @@
 | 5 Только чтение / веб / изоляция | `test_claude_is_read_only_and_uses_stdin`, `test_claude_gets_only_read_tools_without_mcp`, `test_agents_work_in_clean_folder_outside_session`, `test_rules_treat_files_and_opponent_as_data`, `test_codex_is_read_only_and_uses_stdin` (флаги), `test_claude_web_flags`, `test_codex_search_flag_goes_before_exec`, `test_web_is_shared_and_switches_next_round`, `test_web_command_toggles_session` | фактическое соблюдение ограничений самими CLI не проверяется; у Claude это белый список инструментов, не песочница ОС |
 | 6 Без shell, stdin | `test_no_shell_true` (AST), `test_run_cli_passes_long_prompt_via_stdin`, таймаут/отмена, `test_cancel_kills_the_whole_process_tree` | запуск настоящих `.cmd`-обёрток — только вручную |
 | 7 Восстановление | `test_append_after_truncated_line_keeps_new_event`, `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
+| 9 Без угодливости | `test_concession_without_argument_counts_as_reject`, `test_concession_with_argument_counts`, `test_agreement_in_critique_round_is_not_consensus`, `test_critique_round_never_makes_consensus_impossible`, `test_roles_differ_are_stable_and_shared`, `test_roles_can_be_turned_off`, `test_critique_and_last_round_prompts`, `test_resume_keeps_convinced_by_in_log`, `test_app_debate_has_roles_and_critique_round` | действительно ли настоящие модели спорят по существу, а не формально заполняют `convinced_by`, — только живым прогоном |
 | 8 Яйца | `test_egg_blocks_consensus_in_its_round`, `test_no_eggs_in_blind_round`, `test_eggs_run_out_and_consensus_follows`, `test_snapshot_shows_same_egg_stock_to_both`, `test_resume_keeps_egg_stock_and_reads_old_protocols`, `test_eggs_shown_in_feed_and_export` | соразмерно ли настоящие модели используют яйца — только живым прогоном |
 | Расход / лимиты | `test_reply_usage_counts_failed_attempts_too`, `test_budget_check_pauses_before_round`, `test_usage_totals_skips_old_and_earlier_events`, `test_codex_reports_usage_from_json_events`, `test_claude_reports_usage_and_cost`, `test_usage_indicator_and_daily_limit`, `test_parse_bribe_amount`, `test_bribes_count_only_today`, `test_bribe_raises_limit_and_debate_continues`, `test_old_config_gets_limits_section` | остаток лимитов подписки недоступен из CLI |
 | Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs`, `test_progress_line_states`, `test_progress_bar_shows_while_running_and_is_not_saved`, `test_progress_events_per_agent`, `test_progress_reports_failure`, `test_stop_button_stops_debate`, `test_copy_button_copies_message_text` | как анимация выглядит в разных терминалах — вручную |
@@ -116,12 +124,12 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 69 passed (на момент 2026-11-03)
+python -m pytest -q tests          # должно быть: 78 passed (на момент 2026-11-05)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
 
-`--mock stubborn,agree` задаёт поведение фиктивных агентов: `agree`, `stubborn`, `hothead` (бросает яйцо каждый раунд), `flaky` (первый ответ битый), `slow`.
+`--mock stubborn,agree` задаёт поведение фиктивных агентов: `agree`, `stubborn`, `hothead` (бросает яйцо каждый раунд), `flaky` (первый ответ битый), `slow`, `pushover` (поддакивает без довода — голоса не засчитываются).
 Тесты не должны вызывать настоящие CLI.
 
 CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (Python 3.12) при каждом PR и push в `main`.
@@ -145,8 +153,9 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 
 ## Известные ограничения и бэклог
 
-- **Угодливость**: участники могут соглашаться слишком быстро. Идеи: запрет `ACCEPT` в раунде 1,
-  роль «адвоката дьявола», требование явного аргумента для уступки.
+- **Угодливость**: роли, раунд критики и `convinced_by` (инвариант 9) мешают поддакиванию, но модель может
+  заполнить `convinced_by` формально. Дальше — проверять, что довод действительно есть в репликах оппонента,
+  и смотреть на живых спорах, не стали ли роли поводом спорить ради спора.
 - **Рост контекста**: раунды старше двух последних сжимаются обрезкой (`_compact_log`), а не настоящим резюме.
 - **Прогресс внутри вызова** — только «думает N с» (событие `progress`, в протокол не пишется). Что именно
   агент делает (какие файлы читает) — можно показать через `--output-format stream-json` / события `codex exec --json`.
@@ -156,8 +165,8 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - Поле `rounds` в вердикте без консенсуса равно `max_rounds + 1` (номер следующего раунда) — стоит уточнить семантику.
 - Изображения передаются явно только Codex (`-i`); Claude читает их сам инструментом Read.
 - Протокол рассчитан ровно на двух участников.
-- Изоляция Claude держится на белом списке инструментов, а не на песочнице ОС. Codex в `read-only` может читать
-  любой путь, в том числе `sessions/` (рабочая папка пустая, но абсолютные пути вложений указывают рядом с
+- Изоляция Claude держится на белом списке инструментов, а не на песочнице ОС. Codex в `read-only` выполняет
+  команды (только чтение) и может читать любой путь, в том числе `sessions/` (рабочая папка пустая, но абсолютные пути вложений указывают рядом с
   `events.jsonl`) — запрет только в правилах. Для файла вне `files/` Claude получает `--add-dir` на всю его папку.
 - С `/web on` возможна утечка через сайты (prompt injection: страница просит подставить содержимое файлов в
   адрес). Защита — только предупреждение в промпте и то, что веб выключен по умолчанию; фильтра адресов нет.
@@ -201,3 +210,8 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - 2026-11-03 — Кнопка «⧉» копирования у сообщений ленты: копируется исходный текст (у вердикта — только итоговый
   ответ), а не отрисовка. Кроме `copy_to_clipboard` (OSC 52, понимают не все терминалы) — запись в буфер Windows
   через WinAPI (`ctypes`, без новых зависимостей).
+- 2026-11-05 — Без угодливости (запрос председателя: «участники — представители разных взглядов, но по итогу
+  приходят к консенсусу»): роли Скептик/Конструктор вместо одного «адвоката дьявола» — симметрично, у каждого свой
+  взгляд; уступка чужому варианту только с доводом (`convinced_by`), иначе `REJECT` — проверяет модератор, а не
+  промпт; раунд 1 — раунд критики (`min_consensus_round = 2` в `config.json`; в движке по умолчанию 1, чтобы тесты
+  протокола проверяли своё); в последнем раунде — призыв к синтезу. Роли — по хешу вопроса, без нового события.
