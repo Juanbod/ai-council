@@ -24,6 +24,10 @@ BASE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = {
     "sessions_dir": "sessions",
     "max_rounds": 5,
+    # без угодливости: согласие засчитывается не раньше этого раунда (раунд 1 — для критики),
+    # участникам даются разные роли-взгляды (Скептик и Конструктор)
+    "min_consensus_round": 2,
+    "roles": True,
     "agents": [
         {"type": "claude", "name": "Claude", "exe": "claude", "model": "", "timeout": 900,
          "use_json_schema": True},
@@ -600,7 +604,8 @@ class CouncilApp(App):
             agent = next((a for a in self._agents_info() if a[0] == e["agent"]), (e["agent"], "white"))
             vote = {"ACCEPT": f"✅ принимает `{e['vote_id']}`", "REJECT": "❌ отклоняет",
                     "ABSTAIN": "— воздерживается"}[e["vote"]]
-            md = [f"**{e['agent']}** · раунд {e['round']} · {vote}"]
+            role = f" ({e['role']})" if e.get("role") else ""
+            md = [f"**{e['agent']}**{role} · раунд {e['round']} · {vote}"]
             if e.get("egg"):
                 target = next((n for n, _ in self._agents_info() if n != e["agent"]), "оппонента")
                 md.append(f"> 🥚💥 **{e['agent']} бросает яйцо в {target}!** За что: {e['egg']}")
@@ -610,6 +615,8 @@ class CouncilApp(App):
                 md.append(e["position"])
             if e["critique"]:
                 md.append("**Критика / ответы:** " + e["critique"])
+            if e.get("convinced_by"):
+                md.append("**Убедило:** " + e["convinced_by"])
             if e["questions"]:
                 md.append("**Вопросы оппоненту:**\n" + "\n".join(f"- {q}" for q in e["questions"]))
             if e.get("proposed"):
@@ -859,8 +866,11 @@ class CouncilApp(App):
         await self.add_to_feed(e)
         d = Debate(build_agents(self.cfg, self.mock), s, question, self._emitter(s),
                    max_rounds=s.meta.get("max_rounds", self.cfg["max_rounds"]),
-                   budget_check=self.budget_check)
+                   budget_check=self.budget_check, **self.debate_style())
         await self._launch(s, d, lambda: d.run())
+
+    def debate_style(self) -> dict:
+        return {"roles": bool(self.cfg["roles"]), "min_consensus_round": int(self.cfg["min_consensus_round"])}
 
     async def continue_debate(self, s: Session, n: int):
         if s.id in self.running:
@@ -869,7 +879,7 @@ class CouncilApp(App):
         d = self.debates.get(s.id) or Debate.from_events(
             build_agents(self.cfg, self.mock), s, self._emitter(s),
             max_rounds=s.meta.get("max_rounds", self.cfg["max_rounds"]),
-            budget_check=self.budget_check)
+            budget_check=self.budget_check, **self.debate_style())
         if d is None:
             self.notify("Нечего продолжать — задайте вопрос", severity="warning")
             return
@@ -920,7 +930,10 @@ class CouncilApp(App):
             elif k == "round":
                 lines += [f"### {e['text']}", ""]
             elif k == "reply":
-                lines += [f"**{e['agent']}** — голос: {e['vote']} {e['vote_id']}", "", e["position"], ""]
+                role = f" ({e['role']})" if e.get("role") else ""
+                lines += [f"**{e['agent']}**{role} — голос: {e['vote']} {e['vote_id']}", "", e["position"], ""]
+                if e.get("convinced_by"):
+                    lines += ["*Убедило:* " + e["convinced_by"], ""]
                 if e.get("egg"):
                     lines += [f"🥚 *Бросает яйцо:* {e['egg']}", ""]
                 if e["critique"]:
