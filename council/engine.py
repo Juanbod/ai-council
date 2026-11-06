@@ -251,6 +251,9 @@ class Debate:
             spent["seconds"] += time.monotonic() - t0
             spent["calls"] += 1
 
+        # что участник делает внутри вызова (читает файл, выполняет команду) — тоже только для индикатора
+        agent.on_activity = lambda text: self.emit(
+            {"kind": "activity", "agent": agent.name, "text": text, "round": self.round})
         last_err = ""
         for attempt in range(2):
             p = prompt if not last_err else (

@@ -260,6 +260,19 @@ def test_progress_line_states():
     assert "ждёт" in progress_line(["Claude", "Codex"], {"Claude": states["Claude"]}, now=100.0)
 
 
+def test_progress_line_shows_current_action_and_step_count():
+    from council.app import progress_line
+    states = {"Claude": {"state": "thinking", "round": 0, "since": 100.0, "seconds": 0,
+                         "activity": "читает proj/a.py", "steps": 1},
+              "Codex": {"state": "done", "round": 0, "since": 90.0, "seconds": 8.4, "steps": 3,
+                        "activity": "выполняет Get-Content a.py"}}
+    line = progress_line(["Claude", "Codex"], states, now=112.0)
+    assert "думает… 12 с [dim]· читает proj/a.py" in line
+    assert "ответил за 8 с [dim](3 действия)" in line and "Get-Content" not in line
+    states["Codex"]["steps"] = 1
+    assert "(1 действие)" in progress_line(["Claude", "Codex"], states, now=112.0)
+
+
 @pytest.mark.asyncio
 async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatch):
     monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [
@@ -273,10 +286,11 @@ async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatc
         bar = app.query_one("#progress")
         text = str(bar.render())
         assert bar.display and "Claude" in text and "думает" in text and "ответил" in text
+        assert "· пишет ответ" in text and "(1 действие)" in text  # шаги внутри вызова видны
         await wait_idle(pilot, s.id)
         await pilot.pause()
         assert not bar.display
-        assert not any(e["kind"] == "progress" for e in s.events())
+        assert not any(e["kind"] in ("progress", "activity") for e in s.events())
 
 
 @pytest.mark.asyncio
@@ -326,7 +340,9 @@ async def test_copy_button_copies_message_text(app, monkeypatch):
         assert sum("reply" in k for k in kinds) >= 2
 
         async def copy(message):
-            message.scroll_visible(animate=False)
+            # immediate: без него прокрутка ждёт следующего обновления и клик изредка мимо экрана
+            message.scroll_visible(animate=False, immediate=True)
+            await pilot.pause()
             await pilot.pause()
             await pilot.click(message.query_one(".copy"))
             await pilot.pause()

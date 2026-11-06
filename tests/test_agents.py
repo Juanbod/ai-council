@@ -1,6 +1,7 @@
 """Обёртки CLI: без shell, промпт через stdin, флаги только-чтения, отмена и таймаут."""
 import ast
 import inspect
+import json
 import sys
 import threading
 import time
@@ -71,7 +72,7 @@ def pid_alive(pid: int) -> bool:
 def captured(monkeypatch):
     calls = []
 
-    def fake(cmd, prompt, cwd, timeout, cancel=None):
+    def fake(cmd, prompt, cwd, timeout, cancel=None, on_line=None):
         calls.append({"cmd": cmd, "prompt": prompt, "cwd": cwd})
         return '{"result": "{}"}'
 
@@ -182,3 +183,92 @@ def test_claude_gets_only_read_tools_without_mcp(captured, tmp_path):
     ag.ask("p", tmp_path, [])
     cmd = captured[-1]["cmd"]
     assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep,WebFetch,WebSearch"
+
+
+def test_run_cli_streams_lines_while_process_runs(tmp_path):
+    # процесс ждёт файл-флажок, который создаёт только on_line: без построчного чтения — таймаут
+    flag = tmp_path / "seen"
+    script = ("import sys, time, pathlib\n"
+              "print('first', flush=True)\n"
+              "p = pathlib.Path(sys.argv[1])\n"
+              "for _ in range(200):\n"
+              "    if p.exists(): break\n"
+              "    time.sleep(0.05)\n"
+              "print('found' if p.exists() else 'missing')\n")
+    seen = []
+
+    def on_line(line):
+        seen.append(line.strip())
+        flag.touch()
+
+    out = run_cli([sys.executable, "-c", script, str(flag)], "", tmp_path, 30, on_line=on_line)
+    assert seen == ["first", "found"] and out.split() == ["first", "found"]
+
+
+# события в том виде, в каком их печатают настоящие CLI (сняты 2026-11-06)
+CLAUDE_STREAM = [
+    {"type": "system", "subtype": "init"},
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": r"C:\tmp\proj\note.txt"}}]}},
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Grep", "input": {"pattern": "def main", "path": r"C:\tmp\proj"}}]}},
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "StructuredOutput", "input": {"position": "x"}}]}},
+    {"type": "result", "is_error": False, "result": "", "structured_output": {"position": "x"},
+     "total_cost_usd": 0.05, "usage": {"input_tokens": 10, "output_tokens": 2}},
+]
+CODEX_STREAM = [
+    {"type": "thread.started", "thread_id": "x"},
+    {"type": "item.started", "item": {"type": "command_execution", "status": "in_progress",
+     "command": "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" "
+                "-Command 'Get-Content -LiteralPath C:\\\\tmp\\\\note.txt'"}},
+    {"type": "item.completed", "item": {"type": "command_execution", "status": "completed",
+     "command": "powershell.exe -Command 'Get-Content -LiteralPath note.txt'"}},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": "{\"a\": 1}"}},
+    {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 3}},
+]
+
+
+def streaming(monkeypatch, events):
+    calls = []
+
+    def fake(cmd, prompt, cwd, timeout, cancel=None, on_line=None):
+        calls.append(cmd)
+        lines = [json.dumps(e, ensure_ascii=False) for e in events]
+        for line in lines:
+            if on_line:
+                on_line(line + "\n")
+        return "\n".join(lines)
+
+    monkeypatch.setattr(agents, "run_cli", fake)
+    monkeypatch.setattr(agents, "resolve_exe", lambda name: name)
+    return calls
+
+
+def test_claude_streams_activity_and_still_returns_answer(monkeypatch, tmp_path):
+    calls = streaming(monkeypatch, CLAUDE_STREAM)
+    seen = []
+    ag = ClaudeAgent()
+    ag.on_activity = seen.append
+    assert json.loads(ag.ask("p", tmp_path, [])) == {"position": "x"}
+    cmd = calls[0]
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json" and "--verbose" in cmd
+    assert len(seen) == 3 and seen[2] == "пишет ответ"
+    assert seen[0].startswith("читает ") and seen[0].endswith("note.txt")
+    assert seen[1].startswith("ищет «def main»")
+    assert ag.last_usage == {"tokens_in": 10, "tokens_out": 2, "cost_usd": 0.05}
+
+
+def test_codex_streams_commands_without_powershell_wrapper(monkeypatch, tmp_path):
+    streaming(monkeypatch, CODEX_STREAM)
+    seen = []
+    ag = CodexAgent()
+    ag.on_activity = seen.append
+    assert ag.ask("p", tmp_path, []) == '{"a": 1}'
+    # только начатые команды, без обёртки powershell и удвоенных слэшей
+    assert seen == ["выполняет Get-Content -LiteralPath C:\\tmp\\note.txt"]
+
+
+def test_no_activity_callback_means_no_parsing(monkeypatch, tmp_path):
+    streaming(monkeypatch, CLAUDE_STREAM)
+    assert json.loads(ClaudeAgent().ask("p", tmp_path, [])) == {"position": "x"}

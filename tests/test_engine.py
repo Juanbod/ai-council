@@ -585,3 +585,16 @@ def test_resume_keeps_convinced_by_in_log(session):
     run(session, MockAgent("Claude", "stubborn"), MockAgent("Codex", "agree"), rounds=3)
     d = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], session, lambda e: None)
     assert any(e["convinced_by"] for e in d.log if e["agent"] == "Codex")
+
+
+def test_activity_is_reported_per_agent_and_round(tmp_path):
+    s = Store(tmp_path / "sessions").create("Шаги")
+    f = tmp_path / "a.py"
+    f.write_text("x")
+    s.attach(f)
+    events = []
+    Debate([MockAgent("A", "agree"), MockAgent("B", "agree")], s, "вопрос", events.append,
+           max_rounds=1).run()
+    acts = [e for e in events if e["kind"] == "activity"]
+    assert {(e["agent"], e["round"], e["text"]) for e in acts} >= {
+        ("A", 0, "читает a.py"), ("B", 0, "читает a.py"), ("A", 1, "пишет ответ")}

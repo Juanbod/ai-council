@@ -147,6 +147,12 @@ def usage_line(names: list[str], today: dict, limits: dict) -> str:
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+
 def progress_line(names: list[str], states: dict, now: float) -> str:
     rnd = next(iter(states.values()))["round"]
     head = "Независимый анализ" if rnd == 0 else f"Раунд {rnd}"
@@ -158,10 +164,12 @@ def progress_line(names: list[str], states: dict, now: float) -> str:
             continue
         elapsed = now - st["since"]
         spin = SPINNER[int(now * 8) % len(SPINNER)]
+        doing = f" [dim]· {escape(st['activity'])}[/dim]" if st.get("activity") else ""
+        steps = f" [dim]({st['steps']} {plural(st['steps'], 'действие', 'действия', 'действий')})[/dim]"             if st.get("steps") else ""
         parts.append({
-            "thinking": f"{spin} {who} думает… {elapsed:.0f} с",
-            "retry": f"{spin} {who} переделывает ответ (не по схеме)… {elapsed:.0f} с",
-            "done": f"[green]✓[/green] {who} ответил за {st['seconds']:.0f} с",
+            "thinking": f"{spin} {who} думает… {elapsed:.0f} с{doing}",
+            "retry": f"{spin} {who} переделывает ответ (не по схеме)… {elapsed:.0f} с{doing}",
+            "done": f"[green]✓[/green] {who} ответил за {st['seconds']:.0f} с{steps}",
             "failed": f"[red]✗[/red] {who} — сбой, засчитан REJECT",
         }.get(st["state"], who))
     return f"[dim]{head}:[/dim]  " + "   │   ".join(parts)
@@ -823,7 +831,7 @@ class CouncilApp(App):
     # ---------- обсуждение в фоне ----------
     def _emitter(self, s: Session):
         def emit(e):
-            if e.get("kind") == "progress":  # только для индикатора, в протокол не пишется
+            if e.get("kind") in ("progress", "activity"):  # только для индикатора, в протокол не пишется
                 self.call_from_thread(self._on_progress, s.id, e)
                 return
             saved = s.append(e)
@@ -831,7 +839,15 @@ class CouncilApp(App):
         return emit
 
     def _on_progress(self, sid: str, e: dict):
-        self.progress.setdefault(sid, {})[e["agent"]] = {**e, "since": time.monotonic()}
+        states = self.progress.setdefault(sid, {})
+        prev = states.get(e["agent"])
+        same_round = prev is not None and prev["round"] == e["round"]
+        if e["kind"] == "activity":  # таймер не сбрасываем: это шаг внутри того же вызова
+            if prev is not None:
+                prev.update(activity=e["text"], steps=prev.get("steps", 0) + 1)
+        else:  # действия считаем за весь ответ, включая повторную попытку
+            states[e["agent"]] = {**e, "since": time.monotonic(),
+                                  "steps": prev.get("steps", 0) if same_round else 0}
         self.refresh_progress()
 
     def refresh_progress(self):
