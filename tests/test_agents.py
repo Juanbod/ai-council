@@ -221,7 +221,7 @@ CODEX_STREAM = [
     {"type": "thread.started", "thread_id": "x"},
     {"type": "item.started", "item": {"type": "command_execution", "status": "in_progress",
      "command": "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" "
-                "-Command 'Get-Content -LiteralPath C:\\\\tmp\\\\note.txt'"}},
+                "-Command \"Get-Content -LiteralPath 'C:\\\\tmp\\\\note.txt'\""}},
     {"type": "item.completed", "item": {"type": "command_execution", "status": "completed",
      "command": "powershell.exe -Command 'Get-Content -LiteralPath note.txt'"}},
     {"type": "item.completed", "item": {"type": "agent_message", "text": "{\"a\": 1}"}},
@@ -266,9 +266,62 @@ def test_codex_streams_commands_without_powershell_wrapper(monkeypatch, tmp_path
     ag.on_activity = seen.append
     assert ag.ask("p", tmp_path, []) == '{"a": 1}'
     # только начатые команды, без обёртки powershell и удвоенных слэшей
-    assert seen == ["выполняет Get-Content -LiteralPath C:\\tmp\\note.txt"]
+    assert seen == ["выполняет Get-Content -LiteralPath 'C:\\tmp\\note.txt'"]
 
 
-def test_no_activity_callback_means_no_parsing(monkeypatch, tmp_path):
+def test_claude_answers_without_activity_callback(monkeypatch, tmp_path):
     streaming(monkeypatch, CLAUDE_STREAM)
     assert json.loads(ClaudeAgent().ask("p", tmp_path, [])) == {"position": "x"}
+
+
+def test_big_stdin_without_reader_respects_timeout_and_cancel(tmp_path):
+    # ревью совета PR #7: запись промпта в основном потоке блокировалась, и таймаут/отмена не срабатывали
+    sleeper = [sys.executable, "-c", "import time; time.sleep(5)"]
+    t0 = time.monotonic()
+    with pytest.raises(AgentError, match="таймаут"):
+        run_cli(sleeper, "x" * 1_000_000, tmp_path, timeout=0.5)
+    assert time.monotonic() - t0 < 3
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    t0 = time.monotonic()
+    with pytest.raises(Cancelled):
+        run_cli(sleeper, "x" * 1_000_000, tmp_path, 30, cancel)
+    assert time.monotonic() - t0 < 3
+
+
+def test_children_holding_output_are_not_a_success(tmp_path, monkeypatch):
+    # обёртка вышла, а её потомок держит stdout: раньше run_cli ждал его и возвращал успех
+    monkeypatch.setattr(agents, "EOF_GRACE", 0.5)
+    script = ("import subprocess, sys; "
+              "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']); "
+              "print('early', flush=True)")
+    t0 = time.monotonic()
+    with pytest.raises(AgentError, match="не закрыли вывод"):
+        run_cli([sys.executable, "-c", script], "", tmp_path, timeout=60)
+    assert time.monotonic() - t0 < 3
+
+
+def test_no_activity_after_run_cli_returns(tmp_path):
+    seen = []
+    with pytest.raises(AgentError, match="таймаут"):
+        run_cli([sys.executable, "-c", "import time; print('a', flush=True); time.sleep(0.6); print('b')"],
+                "", tmp_path, timeout=0.3, on_line=seen.append)
+    time.sleep(1)
+    assert seen == ["a\n"]  # «b» после таймаута индикатору не передаётся
+
+
+@pytest.mark.parametrize("command, shown", [
+    # живой формат: путь к powershell в двойных кавычках, команда в одинарных — без экранирования
+    ('"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe" -Command \'Get-Content a.txt\'',
+     "Get-Content a.txt"),
+    # команда в двойных кавычках: Codex экранирует обратные слэши и кавычки
+    ('"C:\\\\WINDOWS\\\\powershell.exe" -Command "Get-Content -LiteralPath \'C:\\\\Users\\\\a.txt\'"',
+     "Get-Content -LiteralPath 'C:\\Users\\a.txt'"),
+    ('powershell.exe -NoProfile -Command \'Get-ChildItem\'', "Get-ChildItem"),
+    # без обёртки — как есть: Invoke-Command не обёртка, UNC-путь не портится
+    ("Invoke-Command -ComputerName x -Command 'dir'", "Invoke-Command -ComputerName x -Command 'dir'"),
+    ("Get-Content \\\\server\\share\\a.txt", "Get-Content \\\\server\\share\\a.txt"),
+    ("powershell.exe -Command 'Get-Content \\\\server\\share\\a.txt'", "Get-Content \\\\server\\share\\a.txt"),
+])
+def test_codex_command_strips_only_the_wrapper(command, shown):
+    assert agents.codex_command(command) == shown

@@ -235,10 +235,20 @@ class Debate:
                 + json.dumps(state, ensure_ascii=False, indent=1))
 
     # --- вызов с проверкой схемы ---
-    def _progress(self, agent: Agent, state: str, seconds: float = 0.0):
+    def _progress(self, agent: Agent, state: str, seconds: float = 0.0, attempt: int = 0):
         """Состояние участника для индикатора (transient: приложение не пишет его в протокол)."""
         self.emit({"kind": "progress", "agent": agent.name, "state": state, "round": self.round,
-                   "seconds": round(seconds, 1)})
+                   "attempt": attempt, "seconds": round(seconds, 1)})
+
+    def _activity_sink(self, agent: Agent, attempt: int):
+        """Что участник делает внутри вызова (читает файл, выполняет команду) — тоже только для индикатора.
+        Раунд и попытка фиксируются при создании: позднее событие не припишется следующей попытке."""
+        rnd = self.round
+
+        def sink(text: str):
+            self.emit({"kind": "activity", "agent": agent.name, "text": text, "round": rnd,
+                       "attempt": attempt})
+        return sink
 
     def _ask(self, agent: Agent, prompt: str, attachments: list[Path]) -> dict:
         """Ответ участника с полем usage — суммарный расход всех попыток, включая неудачные."""
@@ -251,9 +261,6 @@ class Debate:
             spent["seconds"] += time.monotonic() - t0
             spent["calls"] += 1
 
-        # что участник делает внутри вызова (читает файл, выполняет команду) — тоже только для индикатора
-        agent.on_activity = lambda text: self.emit(
-            {"kind": "activity", "agent": agent.name, "text": text, "round": self.round})
         last_err = ""
         for attempt in range(2):
             p = prompt if not last_err else (
@@ -261,7 +268,8 @@ class Debate:
                          "Верни ТОЛЬКО один JSON-объект по схеме.")
             t0 = time.monotonic()
             agent.last_usage = None
-            self._progress(agent, "thinking" if attempt == 0 else "retry")
+            self._progress(agent, "thinking" if attempt == 0 else "retry", attempt=attempt)
+            agent.on_activity = self._activity_sink(agent, attempt)
             try:
                 raw = agent.ask(p, self.session.workdir, attachments, self.cancel)
                 account(t0)
@@ -269,7 +277,7 @@ class Debate:
                     raise ValueError("пустой ответ")
                 data = extract_json(raw)
                 validate(data, SCHEMA)
-                self._progress(agent, "done", spent["seconds"])
+                self._progress(agent, "done", spent["seconds"], attempt)
                 return {"ok": True, **data, "usage": spent}
             except Cancelled:
                 raise
@@ -279,7 +287,7 @@ class Debate:
                 last_err = (e.message if isinstance(e, ValidationError) else str(e))[:500]
                 self.emit({"kind": "warning", "agent": agent.name,
                            "text": f"попытка {attempt + 1}: {last_err}"})
-        self._progress(agent, "failed", spent["seconds"])
+        self._progress(agent, "failed", spent["seconds"], attempt)
         # сбой участника = несогласие, а не молчаливое ACCEPT
         return {"ok": False, "position": "", "critique": f"[сбой: {last_err}]", "questions": [],
                 "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": "", "usage": spent}

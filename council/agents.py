@@ -1,5 +1,6 @@
 """Участники совета: обёртки над CLI Claude Code и Codex, плюс фиктивные агенты для тестов."""
 import json
+import re
 import os
 import shutil
 import signal
@@ -64,6 +65,10 @@ def kill_tree(proc: subprocess.Popen):
     proc.wait(timeout=30)
 
 
+# сколько ждать конца вывода после выхода самого CLI (не дольше общего таймаута)
+EOF_GRACE = 30.0
+
+
 def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
             cancel: threading.Event | None = None, on_line=None) -> str:
     """Запуск без shell=True, промпт через stdin (обходит лимит длины командной строки Windows).
@@ -72,41 +77,59 @@ def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8",
                             errors="replace", creationflags=flags, start_new_session=os.name != "nt")
+    deadline = time.monotonic() + timeout
     out_lines: list[str] = []
     err_lines: list[str] = []
+    closed = threading.Event()  # после выхода из run_cli поздние строки индикатору не передаются
 
     def pump(stream, sink, callback):
         for line in stream:
             sink.append(line)
-            if callback is not None:
+            if callback is not None and not closed.is_set():
                 try:
                     callback(line)
                 except Exception:  # индикатор не должен ронять вызов
                     pass
 
-    readers = [threading.Thread(target=pump, args=(proc.stdout, out_lines, on_line), daemon=True),
-               threading.Thread(target=pump, args=(proc.stderr, err_lines, None), daemon=True)]
-    for t in readers:
-        t.start()
-    try:
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-    except OSError:  # процесс завершился, не дочитав stdin, — код выхода скажет почему
-        pass
-    deadline = time.monotonic() + timeout
-    while True:
+    def feed():
+        # запись в отдельном потоке: CLI, не читающий stdin, не должен блокировать отмену и таймаут
         try:
-            proc.wait(timeout=0.5)
-            break
-        except subprocess.TimeoutExpired:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except (OSError, ValueError):  # процесс завершился, не дочитав stdin, — код выхода скажет почему
+            pass
+
+    threads = [threading.Thread(target=pump, args=(proc.stdout, out_lines, on_line), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, err_lines, None), daemon=True),
+               threading.Thread(target=feed, daemon=True)]
+    for t in threads:
+        t.start()
+    readers = threads[:2]
+    exited_at = None
+    try:
+        # готово, только когда процесс вышел И оба канала дочитаны до конца
+        while proc.poll() is None or any(t.is_alive() for t in readers):
             if cancel is not None and cancel.is_set():
                 kill_tree(proc)
                 raise Cancelled()
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 kill_tree(proc)
                 raise AgentError(f"таймаут {timeout} с")
-    for t in readers:
-        t.join(timeout=30)
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+                continue
+            exited_at = exited_at or now
+            if now - exited_at > EOF_GRACE:  # обёртка вышла, а её потомок держит вывод
+                kill_tree(proc)
+                raise AgentError("CLI завершился, но его дочерние процессы не закрыли вывод")
+            for t in readers:
+                t.join(timeout=0.1)
+    finally:
+        closed.set()
     out, err = "".join(out_lines), "".join(err_lines)
     if proc.returncode != 0:
         tail = (err or out or "").strip()[-800:]
@@ -207,14 +230,24 @@ def claude_activity(event: dict) -> list[str]:
     return out
 
 
+# обёртка, которую Codex ставит перед командой: "C:\\…\\powershell.exe" -Command <команда в кавычках>
+PS_WRAPPER = re.compile(r'^\s*"?[^"\s]*\b(?:powershell|pwsh)(?:\.exe)?"?\s+(?:-\w+\s+)*?-Command\s+(.+)$',
+                        re.IGNORECASE | re.DOTALL)
+
+
 def codex_command(command: str) -> str:
-    """Codex оборачивает команды в `powershell.exe -Command '…'` — показываем саму команду."""
-    marker = "-Command "
-    if marker in command:
-        command = command.split(marker, 1)[1].strip()
-        if len(command) > 1 and command[0] == command[-1] and command[0] in "'\"":
-            command = command[1:-1]
-    return command.replace("\\\\", "\\")  # Codex удваивает обратные слэши путей внутри команды
+    """Показываем саму команду без обёртки PowerShell. Снимаем только обёртку в начале строки
+    (а не любое `-Command `, как внутри Invoke-Command), и только её кавычки: в двойных кавычках
+    Codex экранирует `\\` и `"` (проверено на живых событиях), в одинарных — нет."""
+    m = PS_WRAPPER.match(command)
+    if not m:
+        return command
+    inner = m.group(1).strip()
+    if len(inner) > 1 and inner[0] == inner[-1] == "'":
+        return inner[1:-1]
+    if len(inner) > 1 and inner[0] == inner[-1] == '"':
+        return re.sub(r'\\([\\"])', r"\1", inner[1:-1])
+    return inner
 
 
 def codex_activity(event: dict) -> list[str]:

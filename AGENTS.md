@@ -85,12 +85,12 @@
 | 3 Консенсус по id | `test_two_accepts_of_different_ids_are_not_consensus`, `test_accept_of_id_proposed_in_same_round_is_not_consensus` | — |
 | 4 Сбой ≠ согласие | `test_flaky_agent_is_retried`, `test_two_failures_count_as_reject` | — |
 | 5 Только чтение / веб / изоляция | `test_claude_is_read_only_and_uses_stdin`, `test_claude_gets_only_read_tools_without_mcp`, `test_agents_work_in_clean_folder_outside_session`, `test_rules_treat_files_and_opponent_as_data`, `test_codex_is_read_only_and_uses_stdin` (флаги), `test_claude_web_flags`, `test_codex_search_flag_goes_before_exec`, `test_web_is_shared_and_switches_next_round`, `test_web_command_toggles_session` | фактическое соблюдение ограничений самими CLI не проверяется; у Claude это белый список инструментов, не песочница ОС |
-| 6 Без shell, stdin | `test_no_shell_true` (AST), `test_run_cli_passes_long_prompt_via_stdin`, таймаут/отмена, `test_cancel_kills_the_whole_process_tree` | запуск настоящих `.cmd`-обёрток — только вручную |
+| 6 Без shell, stdin | `test_no_shell_true` (AST), `test_run_cli_passes_long_prompt_via_stdin`, `test_big_stdin_without_reader_respects_timeout_and_cancel`, `test_children_holding_output_are_not_a_success`, `test_no_activity_after_run_cli_returns`, таймаут/отмена, `test_cancel_kills_the_whole_process_tree` | запуск настоящих `.cmd`-обёрток — только вручную |
 | 7 Восстановление | `test_append_after_truncated_line_keeps_new_event`, `test_resume_from_events`, `test_resume_drops_half_written_round`, `test_resume_twice_after_replayed_round`, `test_resume_ignores_stopped_attempt`, `test_continue_after_stop_runs_again` | — |
 | 9 Без угодливости | `test_concession_without_argument_counts_as_reject`, `test_concession_with_argument_counts`, `test_agreement_in_critique_round_is_not_consensus`, `test_critique_round_never_makes_consensus_impossible`, `test_roles_differ_are_stable_and_shared`, `test_roles_can_be_turned_off`, `test_critique_and_last_round_prompts`, `test_resume_keeps_convinced_by_in_log`, `test_app_debate_has_roles_and_critique_round` | действительно ли настоящие модели спорят по существу, а не формально заполняют `convinced_by`, — только живым прогоном |
 | 8 Яйца | `test_egg_blocks_consensus_in_its_round`, `test_no_eggs_in_blind_round`, `test_eggs_run_out_and_consensus_follows`, `test_snapshot_shows_same_egg_stock_to_both`, `test_resume_keeps_egg_stock_and_reads_old_protocols`, `test_eggs_shown_in_feed_and_export` | соразмерно ли настоящие модели используют яйца — только живым прогоном |
 | Расход / лимиты | `test_reply_usage_counts_failed_attempts_too`, `test_budget_check_pauses_before_round`, `test_usage_totals_skips_old_and_earlier_events`, `test_codex_reports_usage_from_json_events`, `test_claude_reports_usage_and_cost`, `test_usage_indicator_and_daily_limit`, `test_parse_bribe_amount`, `test_bribes_count_only_today`, `test_bribe_raises_limit_and_debate_continues`, `test_old_config_gets_limits_section` | остаток лимитов подписки недоступен из CLI |
-| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs`, `test_progress_line_states`, `test_progress_bar_shows_while_running_and_is_not_saved`, `test_progress_events_per_agent`, `test_progress_reports_failure`, `test_progress_line_shows_current_action_and_step_count`, `test_activity_is_reported_per_agent_and_round`, `test_run_cli_streams_lines_while_process_runs`, `test_claude_streams_activity_and_still_returns_answer`, `test_codex_streams_commands_without_powershell_wrapper`, `test_stop_button_stops_debate`, `test_copy_button_copies_message_text` | как анимация выглядит в разных терминалах — вручную |
+| Интерфейс | `test_new_session_button_opens_dialog`, `test_egg_throw_animation_plays_for_live_eggs`, `test_progress_line_states`, `test_progress_bar_shows_while_running_and_is_not_saved`, `test_progress_events_per_agent`, `test_progress_reports_failure`, `test_progress_line_shows_current_action_and_step_count`, `test_activity_is_reported_per_agent_and_round`, `test_run_cli_streams_lines_while_process_runs`, `test_claude_streams_activity_and_still_returns_answer`, `test_codex_streams_commands_without_powershell_wrapper`, `test_codex_command_strips_only_the_wrapper`, `test_late_activity_is_dropped`, `test_activity_is_bound_to_its_attempt`, `test_stop_button_stops_debate`, `test_copy_button_copies_message_text` | как анимация выглядит в разных терминалах — вручную |
 | meta / Session / вложения | `test_meta_updates_from_stale_instance_do_not_revert`, `test_store_returns_one_instance_per_id`, `test_rename_after_debate_keeps_status`, `test_attach_project_folder_skips_sessions`, `test_attach_sessions_folder_is_refused` | — |
 
 Регрессионные тесты проверены: при откате соответствующих исправлений они падают.
@@ -129,7 +129,7 @@
 
 ```
 pip install -r requirements.txt
-python -m pytest -q tests          # должно быть: 84 passed (на момент 2026-11-06)
+python -m pytest -q tests          # должно быть: 95 passed (на момент 2026-11-06)
 .\run.bat --mock                   # интерфейс на фиктивных агентах, без затрат
 .\run.bat                          # настоящие Claude и Codex
 ```
@@ -170,6 +170,8 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
 - Поле `rounds` в вердикте без консенсуса равно `max_rounds + 1` (номер следующего раунда) — стоит уточнить семантику.
 - Изображения передаются явно только Codex (`-i`); Claude читает их сам инструментом Read.
 - Протокол рассчитан ровно на двух участников.
+- Остановка на Windows — `taskkill /T` по PID обёртки: если обёртка уже вышла, а её потомок жив, дерево не
+  находится и потомок остаётся (вызов при этом честно завершается ошибкой). Надёжнее — Job Objects.
 - Изоляция Claude держится на белом списке инструментов, а не на песочнице ОС. Codex в `read-only` выполняет
   команды (только чтение) и может читать любой путь, в том числе `sessions/` (рабочая папка пустая, но абсолютные пути вложений указывают рядом с
   `events.jsonl`) — запрет только в правилах. Для файла вне `files/` Claude получает `--add-dir` на всю его папку.
@@ -224,3 +226,9 @@ CI: `.github/workflows/tests.yml` гоняет `pytest` на `windows-latest` (P
   события `--json`; вывод CLI читается построчно в потоках `run_cli`. Действия — transient-события `activity`,
   как и `progress`: в протокол и снимок не попадают, на дебаты не влияют. Codex показываем саму команду без обёртки
   PowerShell.
+- 2026-11-06 — По ревью совета PR #7 (заседание «Ревью PR #7», консенсус в раунде 3; оба P1 воспроизведены вручную):
+  промпт пишется в stdin отдельным потоком (CLI, не читающий stdin, блокировал отмену и таймаут); успех — только
+  когда процесс вышел и оба канала дочитаны, в пределах общего таймаута; если обёртка вышла, а потомок держит
+  вывод дольше `EOF_GRACE`, — `AgentError`, а не неполный ответ. Событие `activity` несёт раунд и попытку, приложение
+  отбрасывает поздние; после выхода из `run_cli` строки индикатору не передаются. `codex_command` снимает только
+  обёртку PowerShell в начале строки и раскрывает экранирование только внутри двойных кавычек.

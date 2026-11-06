@@ -273,6 +273,28 @@ def test_progress_line_shows_current_action_and_step_count():
     assert "(1 действие)" in progress_line(["Claude", "Codex"], states, now=112.0)
 
 
+
+def test_late_activity_is_dropped(app):
+    # ревью совета PR #7: событие, пришедшее после завершения, повтора или нового раунда, не засчитывается
+    def ev(kind, **kw):
+        app._on_progress("sid", {"kind": kind, "agent": "Claude", "round": 1, "attempt": 0, **kw})
+
+    def state():
+        return app.progress["sid"]["Claude"]
+
+    ev("progress", state="thinking", seconds=0)
+    ev("activity", text="читает a.py")
+    assert state()["steps"] == 1 and state()["activity"] == "читает a.py"
+    ev("progress", state="retry", attempt=1, seconds=0)
+    ev("activity", text="старое", attempt=0)  # от прошлой попытки
+    ev("activity", text="читает b.py", attempt=1)
+    assert state()["steps"] == 2 and state()["activity"] == "читает b.py"
+    ev("progress", state="done", attempt=1, seconds=3)
+    ev("activity", text="после ответа", attempt=1)
+    ev("activity", text="из прошлого раунда", round=0, attempt=1)
+    assert state()["steps"] == 2 and "activity" not in state()  # у ответившего — только число шагов
+
+
 @pytest.mark.asyncio
 async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatch):
     monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [

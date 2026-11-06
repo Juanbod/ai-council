@@ -843,7 +843,10 @@ class CouncilApp(App):
         prev = states.get(e["agent"])
         same_round = prev is not None and prev["round"] == e["round"]
         if e["kind"] == "activity":  # таймер не сбрасываем: это шаг внутри того же вызова
-            if prev is not None:
+            # шаг засчитывается только текущей попытке, пока она идёт: поздние события после
+            # остановки, повтора или нового раунда отбрасываются
+            if (prev is not None and prev["state"] in ("thinking", "retry") and same_round
+                    and prev.get("attempt", 0) == e.get("attempt", 0)):
                 prev.update(activity=e["text"], steps=prev.get("steps", 0) + 1)
         else:  # действия считаем за весь ответ, включая повторную попытку
             states[e["agent"]] = {**e, "since": time.monotonic(),

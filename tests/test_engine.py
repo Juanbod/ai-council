@@ -598,3 +598,14 @@ def test_activity_is_reported_per_agent_and_round(tmp_path):
     acts = [e for e in events if e["kind"] == "activity"]
     assert {(e["agent"], e["round"], e["text"]) for e in acts} >= {
         ("A", 0, "читает a.py"), ("B", 0, "читает a.py"), ("A", 1, "пишет ответ")}
+
+
+def test_activity_is_bound_to_its_attempt(tmp_path):
+    s = Store(tmp_path / "sessions").create("Попытки")
+    events = []
+    Debate([MockAgent("A", "flaky"), MockAgent("B", "agree")], s, "вопрос", events.append,
+           max_rounds=0).run()
+    acts = [(e["agent"], e["attempt"]) for e in events if e["kind"] == "activity"]
+    assert ("A", 0) in acts and ("A", 1) in acts and ("B", 1) not in acts  # у A был повтор, у B — нет
+    done = [e for e in events if e["kind"] == "progress" and e["state"] == "done"]
+    assert {(e["agent"], e["attempt"]) for e in done} == {("A", 1), ("B", 0)}
