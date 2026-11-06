@@ -585,3 +585,43 @@ def test_resume_keeps_convinced_by_in_log(session):
     run(session, MockAgent("Claude", "stubborn"), MockAgent("Codex", "agree"), rounds=3)
     d = Debate.from_events([MockAgent("Claude"), MockAgent("Codex")], session, lambda e: None)
     assert any(e["convinced_by"] for e in d.log if e["agent"] == "Codex")
+
+
+def test_activity_is_reported_per_agent_and_round(tmp_path):
+    s = Store(tmp_path / "sessions").create("Шаги")
+    f = tmp_path / "a.py"
+    f.write_text("x")
+    s.attach(f)
+    events = []
+    Debate([MockAgent("A", "agree"), MockAgent("B", "agree")], s, "вопрос", events.append,
+           max_rounds=1).run()
+    acts = [e for e in events if e["kind"] == "activity"]
+    assert {(e["agent"], e["round"], e["text"]) for e in acts} >= {
+        ("A", 0, "читает a.py"), ("B", 0, "читает a.py"), ("A", 1, "пишет ответ")}
+
+
+def test_activity_is_bound_to_its_attempt(tmp_path):
+    s = Store(tmp_path / "sessions").create("Попытки")
+    events = []
+    Debate([MockAgent("A", "flaky"), MockAgent("B", "agree")], s, "вопрос", events.append,
+           max_rounds=0).run()
+    starts = [e for e in events if e["kind"] == "progress" and e["state"] in ("thinking", "retry")]
+    calls = [e["call"] for e in starts]
+    assert len(calls) == 3 and len(set(calls)) == 3  # A: попытка и повтор, B: одна попытка
+    for e in events:
+        if e["kind"] == "activity":  # каждое действие — от уже начатой попытки того же агента
+            assert any(st["call"] == e["call"] and st["agent"] == e["agent"] for st in starts)
+    done = {e["agent"]: e["call"] for e in events if e["kind"] == "progress" and e["state"] == "done"}
+    assert done["A"] == [st["call"] for st in starts if st["agent"] == "A"][-1]
+
+
+def test_call_ids_differ_after_stop_and_continue(tmp_path):
+    # номер раунда и попытки повторяются у нового Debate после «Стоп» → «Продолжить»; id — нет
+    s = Store(tmp_path / "sessions").create("Поколения")
+    first, second = [], []
+    Debate([MockAgent("A", "agree"), MockAgent("B", "agree")], s, "вопрос", first.append,
+           max_rounds=0).run()
+    Debate([MockAgent("A", "agree"), MockAgent("B", "agree")], s, "вопрос", second.append,
+           max_rounds=0).run()
+    ids = lambda evs: {e["call"] for e in evs if e["kind"] in ("progress", "activity")}  # noqa: E731
+    assert ids(first) and ids(second) and not ids(first) & ids(second)

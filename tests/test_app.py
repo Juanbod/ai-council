@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -260,6 +261,68 @@ def test_progress_line_states():
     assert "ждёт" in progress_line(["Claude", "Codex"], {"Claude": states["Claude"]}, now=100.0)
 
 
+def test_progress_line_shows_current_action_and_step_count():
+    from council.app import progress_line
+    states = {"Claude": {"state": "thinking", "round": 0, "since": 100.0, "seconds": 0,
+                         "activity": "читает proj/a.py", "steps": 1},
+              "Codex": {"state": "done", "round": 0, "since": 90.0, "seconds": 8.4, "steps": 3,
+                        "activity": "выполняет Get-Content a.py"}}
+    line = progress_line(["Claude", "Codex"], states, now=112.0)
+    assert "думает… 12 с [dim]· читает proj/a.py" in line
+    assert "ответил за 8 с [dim](3 действия)" in line and "Get-Content" not in line
+    states["Codex"]["steps"] = 1
+    assert "(1 действие)" in progress_line(["Claude", "Codex"], states, now=112.0)
+
+
+
+def test_late_activity_is_dropped(app):
+    # ревью совета PR #7: событие чужой попытки (повтор, «Стоп» → «Продолжить» в том же раунде),
+    # прошлого раунда или пришедшее после ответа не засчитывается
+    def ev(kind, **kw):
+        app._on_progress("sid", {"kind": kind, "agent": "Claude", "round": 1, "call": "c1", **kw})
+
+    def state():
+        return app.progress["sid"]["Claude"]
+
+    ev("progress", state="thinking", seconds=0)
+    ev("activity", text="читает a.py")
+    assert state()["steps"] == 1 and state()["activity"] == "читает a.py"
+    ev("progress", state="retry", call="c2", seconds=0)
+    ev("activity", text="старое", call="c1")  # от прошлой попытки того же раунда
+    ev("activity", text="из прошлого раунда", round=0, call="c2")  # пока новая попытка идёт
+    ev("activity", text="читает b.py", call="c2")
+    assert state()["steps"] == 2 and state()["activity"] == "читает b.py"
+    ev("progress", state="done", call="c2", seconds=3)
+    ev("activity", text="после ответа", call="c2")
+    assert state()["steps"] == 2 and "activity" not in state()  # у ответившего — только число шагов
+    ev("progress", state="thinking", call="c3", seconds=0)  # тот же раунд снова после «Продолжить»
+    ev("activity", text="опоздавшее от c2", call="c2")
+    assert state().get("activity") is None and state()["steps"] == 2
+
+
+@pytest.mark.asyncio
+async def test_progress_delivery_does_not_block_the_reader(app):
+    # поток чтения вывода CLI не ждёт интерфейс: emit индикатора возвращается сразу, даже когда UI занят
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Неблокирующая доставка")
+        s = app.current
+        emit = app._emitter(s)
+        done = threading.Event()
+
+        def worker():
+            for i in range(50):
+                emit({"kind": "activity", "agent": "Claude", "round": 0, "call": "c", "text": f"шаг {i}"})
+            done.set()
+
+        t = threading.Thread(target=worker, daemon=True)  # при регрессии поток повиснет — не держим им pytest
+        t.start()
+        # UI-цикл в это время стоит на done.wait — call_from_thread завис бы до его освобождения
+        assert done.wait(1), "emit индикатора ждёт интерфейс"
+        t.join(1)
+        await pilot.pause()
+        assert not any(e["kind"] == "activity" for e in s.events())
+
+
 @pytest.mark.asyncio
 async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatch):
     monkeypatch.setattr(app_mod, "build_agents", lambda cfg, mock: [
@@ -273,10 +336,11 @@ async def test_progress_bar_shows_while_running_and_is_not_saved(app, monkeypatc
         bar = app.query_one("#progress")
         text = str(bar.render())
         assert bar.display and "Claude" in text and "думает" in text and "ответил" in text
+        assert "· пишет ответ" in text and "(1 действие)" in text  # шаги внутри вызова видны
         await wait_idle(pilot, s.id)
         await pilot.pause()
         assert not bar.display
-        assert not any(e["kind"] == "progress" for e in s.events())
+        assert not any(e["kind"] in ("progress", "activity") for e in s.events())
 
 
 @pytest.mark.asyncio
@@ -326,7 +390,9 @@ async def test_copy_button_copies_message_text(app, monkeypatch):
         assert sum("reply" in k for k in kinds) >= 2
 
         async def copy(message):
-            message.scroll_visible(animate=False)
+            # immediate: без него прокрутка ждёт следующего обновления и клик изредка мимо экрана
+            message.scroll_visible(animate=False, immediate=True)
+            await pilot.pause()
             await pilot.pause()
             await pilot.click(message.query_one(".copy"))
             await pilot.pause()

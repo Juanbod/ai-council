@@ -1,5 +1,6 @@
 """Участники совета: обёртки над CLI Claude Code и Codex, плюс фиктивные агенты для тестов."""
 import json
+import re
 import os
 import shutil
 import signal
@@ -51,40 +52,97 @@ def resolve_exe(name_or_path: str) -> str:
 
 def kill_tree(proc: subprocess.Popen):
     """claude/codex — обёртки .cmd, настоящий node — их дочерний процесс. proc.kill() убил бы только
-    cmd.exe, а node продолжил бы работу и держал каналы вывода, так что communicate() завис бы."""
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-    else:
-        try:
+    cmd.exe, а node продолжил бы работу и держал каналы вывода, так что communicate() завис бы.
+    Никогда не бросает: вызывается перед raise Cancelled/AgentError и не должна подменять их причину."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+        else:
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    proc.kill()
-    proc.communicate(timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# сколько ждать конца вывода после выхода самого CLI (не дольше общего таймаута)
+EOF_GRACE = 30.0
 
 
 def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
-            cancel: threading.Event | None = None) -> str:
-    """Запуск без shell=True, промпт через stdin (обходит лимит длины командной строки Windows)."""
+            cancel: threading.Event | None = None, on_line=None) -> str:
+    """Запуск без shell=True, промпт через stdin (обходит лимит длины командной строки Windows).
+    Вывод читается построчно в отдельных потоках: on_line(строка) видит события CLI по мере появления."""
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8",
                             errors="replace", creationflags=flags, start_new_session=os.name != "nt")
     deadline = time.monotonic() + timeout
-    pending_input = prompt
-    while True:
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    closed = threading.Event()  # после выхода из run_cli поздние строки индикатору не передаются
+
+    def pump(stream, sink, callback):
+        for line in stream:
+            sink.append(line)
+            if callback is not None and not closed.is_set():
+                try:
+                    callback(line)
+                except Exception:  # индикатор не должен ронять вызов
+                    pass
+
+    def feed():
+        # запись в отдельном потоке: CLI, не читающий stdin, не должен блокировать отмену и таймаут.
+        # Ошибка записи (процесс вышел, не дочитав) не считается сбоем: код выхода скажет, что случилось.
         try:
-            out, err = proc.communicate(input=pending_input, timeout=0.5)
-            break
-        except subprocess.TimeoutExpired:
-            pending_input = None  # stdin уже передан
+            proc.stdin.write(prompt)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    threads = [threading.Thread(target=pump, args=(proc.stdout, out_lines, on_line), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, err_lines, None), daemon=True),
+               threading.Thread(target=feed, daemon=True)]
+    for t in threads:
+        t.start()
+    readers = threads[:2]
+    exited_at = None
+    try:
+        # готово, только когда процесс вышел И оба канала дочитаны до конца
+        while proc.poll() is None or any(t.is_alive() for t in readers):
             if cancel is not None and cancel.is_set():
                 kill_tree(proc)
                 raise Cancelled()
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 kill_tree(proc)
                 raise AgentError(f"таймаут {timeout} с")
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+                continue
+            exited_at = exited_at or now
+            if now - exited_at > EOF_GRACE:  # обёртка вышла, а её потомок держит вывод
+                kill_tree(proc)
+                raise AgentError("CLI завершился, но его дочерние процессы не закрыли вывод")
+            for t in readers:
+                t.join(timeout=0.1)
+    finally:
+        closed.set()
+        threads[2].join(timeout=1)  # writer после выхода процесса завершается сразу (EOF/BrokenPipe)
+    if cancel is not None and cancel.is_set():  # «Стоп» пришёл, пока дочитывали вывод
+        raise Cancelled()
+    out, err = "".join(out_lines), "".join(err_lines)
     if proc.returncode != 0:
         tail = (err or out or "").strip()[-800:]
         raise AgentError(f"код выхода {proc.returncode}: {tail}")
@@ -148,6 +206,104 @@ def codex_events(out: str) -> tuple[dict | None, str]:
     return found, text
 
 
+def short_path(path: str) -> str:
+    """Для индикатора хватает имени файла и его папки."""
+    parts = Path(str(path)).parts
+    return str(Path(*parts[-2:])) if len(parts) > 1 else str(path)
+
+
+def clip(text: str, n: int = 60) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def claude_activity(event: dict) -> list[str]:
+    """Что делает Claude: вызовы инструментов из события assistant потока stream-json."""
+    if event.get("type") != "assistant":
+        return []
+    out = []
+    for c in (event.get("message") or {}).get("content") or []:
+        if not isinstance(c, dict) or c.get("type") != "tool_use":
+            continue
+        name, inp = c.get("name"), c.get("input") or {}
+        if name == "Read":
+            out.append("читает " + short_path(inp.get("file_path", "")))
+        elif name in ("Glob", "Grep"):
+            where = f" в {short_path(inp['path'])}" if inp.get("path") else ""
+            out.append(f"ищет «{clip(inp.get('pattern', ''), 40)}»{where}")
+        elif name == "WebSearch":
+            out.append(f"ищет в сети «{clip(inp.get('query', ''), 40)}»")
+        elif name == "WebFetch":
+            out.append("открывает " + clip(inp.get("url", "")))
+        elif name == "StructuredOutput":
+            out.append("пишет ответ")
+        elif name:
+            out.append(str(name))
+    return out
+
+
+# обёртка, которую Codex ставит перед командой: "C:\\…\\powershell.exe" -Command <команда в кавычках>
+PS_WRAPPER = re.compile(r'^\s*"?[^"\s]*\b(?:powershell|pwsh)(?:\.exe)?"?\s+(?:-\w+\s+)*?-Command\s+(.+)$',
+                        re.IGNORECASE | re.DOTALL)
+
+
+def codex_command(command: str) -> str:
+    """Показываем саму команду без обёртки PowerShell. Снимаем только обёртку в начале строки
+    (а не любое `-Command `, как внутри Invoke-Command), и только её кавычки: в двойных кавычках
+    Codex экранирует `\\` и `"` (проверено на живых событиях), в одинарных — нет."""
+    m = PS_WRAPPER.match(command)
+    if not m:
+        return command
+    inner = m.group(1).strip()
+    if len(inner) > 1 and inner[0] == inner[-1] == "'":
+        return inner[1:-1]
+    if len(inner) > 1 and inner[0] == inner[-1] == '"':
+        return re.sub(r'\\([\\"])', r"\1", inner[1:-1])
+    return inner
+
+
+def codex_activity(event: dict) -> list[str]:
+    """Что делает Codex: начатые команды и поиски из потока `codex exec --json`."""
+    if event.get("type") != "item.started":
+        return []
+    item = event.get("item") or {}
+    kind = item.get("type")
+    if kind == "command_execution":
+        return ["выполняет " + clip(codex_command(item.get("command", "")))]
+    if kind == "web_search":
+        return [f"ищет в сети «{clip(item.get('query', ''), 40)}»"]
+    return []
+
+
+def claude_result(out: str) -> dict | None:
+    """Итоговое событие result потока stream-json (те же поля, что у --output-format json)."""
+    found = None
+    for line in out.splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(e, dict) and e.get("type") == "result":
+            found = e
+    return found
+
+
+def json_events(callback, describe):
+    """on_line для run_cli: разбирает строку JSONL и сообщает действия участника."""
+    if callback is None:
+        return None
+
+    def on_line(line):
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if isinstance(e, dict):
+            for text in describe(e):
+                callback(text)
+    return on_line
+
+
 def outside_dirs(attachments: list[Path], workdir: Path) -> list[Path]:
     """Каталоги вложений вне рабочей папки (для файла — его папка)."""
     root = Path(workdir).resolve()
@@ -167,6 +323,8 @@ class Agent:
     last_usage: dict | None = None
     # доступ в интернет на этот вызов; движок выставляет его из снимка раунда (/web в заседании)
     web = False
+    # on_activity(текст) — что агент делает прямо сейчас («читает a.py»); только для индикатора
+    on_activity = None
 
     def ask(self, prompt: str, workdir: Path, attachments: list[Path],
             cancel: threading.Event | None = None) -> str:
@@ -185,7 +343,9 @@ class ClaudeAgent(Agent):
         # запрет записи и команд — вторым слоем, веб — только с /web
         tools = "Read,Glob,Grep" + (",WebFetch,WebSearch" if self.web else "")
         denied = "Edit,Write,NotebookEdit,Bash" + ("" if self.web else ",WebFetch,WebSearch")
-        cmd = [resolve_exe(self.exe), "-p", "--output-format", "json", "--tools", tools,
+        # stream-json (требует --verbose): по ходу видно, какие файлы Claude читает
+        cmd = [resolve_exe(self.exe), "-p", "--output-format", "stream-json", "--verbose",
+               "--tools", tools,
                "--disallowedTools", denied, "--strict-mcp-config", "--no-session-persistence"]
         if self.web:  # в режиме -p без явного разрешения WebFetch получает отказ
             cmd += ["--allowedTools", "WebFetch,WebSearch"]
@@ -198,17 +358,20 @@ class ClaudeAgent(Agent):
             cmd += ["--json-schema", json.dumps(SCHEMA)]
         cmd += self.extra_args
         try:
-            raw = run_cli(cmd, prompt, workdir, self.timeout, cancel)
+            raw = run_cli(cmd, prompt, workdir, self.timeout, cancel,
+                          json_events(self.on_activity, claude_activity))
         except AgentError as e:
             if not (self.use_json_schema and "unknown option" in str(e).lower()):
                 raise
             # старая версия CLI без --json-schema: схему всё равно проверит модератор
             self.use_json_schema = False
             return self.ask(prompt, workdir, attachments, cancel)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw
+        data = claude_result(raw)
+        if data is None:
+            try:  # --output-format json (через extra_args) или старый CLI
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
         if isinstance(data, dict):
             self.last_usage = claude_usage(data)
             if data.get("is_error"):
@@ -240,7 +403,8 @@ class CodexAgent(Agent):
                 if a.suffix.lower() in IMAGE_EXT:
                     cmd += ["-i", str(a)]
             cmd += self.extra_args + ["-"]
-            out = run_cli(cmd, prompt, workdir, self.timeout, cancel)
+            out = run_cli(cmd, prompt, workdir, self.timeout, cancel,
+                          json_events(self.on_activity, codex_activity))
             self.last_usage, text = codex_events(out)
             return last.read_text(encoding="utf-8") if last.exists() else text
 
@@ -256,6 +420,10 @@ class MockAgent(Agent):
 
     def ask(self, prompt, workdir, attachments, cancel=None):
         self.calls += 1
+        if self.on_activity is not None:  # как настоящие CLI: шаг виден, пока агент «думает»
+            for a in attachments:
+                self.on_activity(f"читает {Path(a).name}")
+            self.on_activity("пишет ответ")
         end = time.monotonic() + self.delay
         while time.monotonic() < end:
             if cancel is not None and cancel.is_set():
