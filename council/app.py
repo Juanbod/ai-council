@@ -430,6 +430,7 @@ class CouncilApp(App):
         yield Footer()
 
     async def on_mount(self):
+        self._loop = asyncio.get_running_loop()  # для неблокирующей доставки индикатора из потоков
         for s in self.store.list():  # обсуждения, прерванные закрытием программы
             if s.meta.get("status") == "running":
                 s.set(status="stopped")
@@ -832,7 +833,12 @@ class CouncilApp(App):
     def _emitter(self, s: Session):
         def emit(e):
             if e.get("kind") in ("progress", "activity"):  # только для индикатора, в протокол не пишется
-                self.call_from_thread(self._on_progress, s.id, e)
+                # без ожидания: поток чтения вывода CLI не должен стоять, пока занят интерфейс
+                # (иначе штатно завершившийся CLI упёрся бы в EOF_GRACE); порядок событий сохраняется
+                try:
+                    self._loop.call_soon_threadsafe(self._on_progress, s.id, e)
+                except RuntimeError:  # приложение уже закрывается — индикатор не нужен
+                    pass
                 return
             saved = s.append(e)
             self.call_from_thread(self._on_event, s.id, saved)
@@ -846,7 +852,7 @@ class CouncilApp(App):
             # шаг засчитывается только текущей попытке, пока она идёт: поздние события после
             # остановки, повтора или нового раунда отбрасываются
             if (prev is not None and prev["state"] in ("thinking", "retry") and same_round
-                    and prev.get("attempt", 0) == e.get("attempt", 0)):
+                    and prev.get("call") == e.get("call")):
                 prev.update(activity=e["text"], steps=prev.get("steps", 0) + 1)
         else:  # действия считаем за весь ответ, включая повторную попытку
             states[e["agent"]] = {**e, "since": time.monotonic(),

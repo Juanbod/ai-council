@@ -605,7 +605,23 @@ def test_activity_is_bound_to_its_attempt(tmp_path):
     events = []
     Debate([MockAgent("A", "flaky"), MockAgent("B", "agree")], s, "вопрос", events.append,
            max_rounds=0).run()
-    acts = [(e["agent"], e["attempt"]) for e in events if e["kind"] == "activity"]
-    assert ("A", 0) in acts and ("A", 1) in acts and ("B", 1) not in acts  # у A был повтор, у B — нет
-    done = [e for e in events if e["kind"] == "progress" and e["state"] == "done"]
-    assert {(e["agent"], e["attempt"]) for e in done} == {("A", 1), ("B", 0)}
+    starts = [e for e in events if e["kind"] == "progress" and e["state"] in ("thinking", "retry")]
+    calls = [e["call"] for e in starts]
+    assert len(calls) == 3 and len(set(calls)) == 3  # A: попытка и повтор, B: одна попытка
+    for e in events:
+        if e["kind"] == "activity":  # каждое действие — от уже начатой попытки того же агента
+            assert any(st["call"] == e["call"] and st["agent"] == e["agent"] for st in starts)
+    done = {e["agent"]: e["call"] for e in events if e["kind"] == "progress" and e["state"] == "done"}
+    assert done["A"] == [st["call"] for st in starts if st["agent"] == "A"][-1]
+
+
+def test_call_ids_differ_after_stop_and_continue(tmp_path):
+    # номер раунда и попытки повторяются у нового Debate после «Стоп» → «Продолжить»; id — нет
+    s = Store(tmp_path / "sessions").create("Поколения")
+    first, second = [], []
+    Debate([MockAgent("A", "agree"), MockAgent("B", "agree")], s, "вопрос", first.append,
+           max_rounds=0).run()
+    Debate([MockAgent("A", "agree"), MockAgent("B", "agree")], s, "вопрос", second.append,
+           max_rounds=0).run()
+    ids = lambda evs: {e["call"] for e in evs if e["kind"] in ("progress", "activity")}  # noqa: E731
+    assert ids(first) and ids(second) and not ids(first) & ids(second)

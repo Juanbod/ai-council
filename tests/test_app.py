@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -275,9 +276,10 @@ def test_progress_line_shows_current_action_and_step_count():
 
 
 def test_late_activity_is_dropped(app):
-    # ревью совета PR #7: событие, пришедшее после завершения, повтора или нового раунда, не засчитывается
+    # ревью совета PR #7: событие чужой попытки (повтор, «Стоп» → «Продолжить» в том же раунде),
+    # прошлого раунда или пришедшее после ответа не засчитывается
     def ev(kind, **kw):
-        app._on_progress("sid", {"kind": kind, "agent": "Claude", "round": 1, "attempt": 0, **kw})
+        app._on_progress("sid", {"kind": kind, "agent": "Claude", "round": 1, "call": "c1", **kw})
 
     def state():
         return app.progress["sid"]["Claude"]
@@ -285,14 +287,40 @@ def test_late_activity_is_dropped(app):
     ev("progress", state="thinking", seconds=0)
     ev("activity", text="читает a.py")
     assert state()["steps"] == 1 and state()["activity"] == "читает a.py"
-    ev("progress", state="retry", attempt=1, seconds=0)
-    ev("activity", text="старое", attempt=0)  # от прошлой попытки
-    ev("activity", text="читает b.py", attempt=1)
+    ev("progress", state="retry", call="c2", seconds=0)
+    ev("activity", text="старое", call="c1")  # от прошлой попытки того же раунда
+    ev("activity", text="из прошлого раунда", round=0, call="c2")  # пока новая попытка идёт
+    ev("activity", text="читает b.py", call="c2")
     assert state()["steps"] == 2 and state()["activity"] == "читает b.py"
-    ev("progress", state="done", attempt=1, seconds=3)
-    ev("activity", text="после ответа", attempt=1)
-    ev("activity", text="из прошлого раунда", round=0, attempt=1)
+    ev("progress", state="done", call="c2", seconds=3)
+    ev("activity", text="после ответа", call="c2")
     assert state()["steps"] == 2 and "activity" not in state()  # у ответившего — только число шагов
+    ev("progress", state="thinking", call="c3", seconds=0)  # тот же раунд снова после «Продолжить»
+    ev("activity", text="опоздавшее от c2", call="c2")
+    assert state().get("activity") is None and state()["steps"] == 2
+
+
+@pytest.mark.asyncio
+async def test_progress_delivery_does_not_block_the_reader(app):
+    # поток чтения вывода CLI не ждёт интерфейс: emit индикатора возвращается сразу, даже когда UI занят
+    async with app.run_test(size=(140, 45)) as pilot:
+        await type_and_send(pilot, "/new Неблокирующая доставка")
+        s = app.current
+        emit = app._emitter(s)
+        done = threading.Event()
+
+        def worker():
+            for i in range(50):
+                emit({"kind": "activity", "agent": "Claude", "round": 0, "call": "c", "text": f"шаг {i}"})
+            done.set()
+
+        t = threading.Thread(target=worker, daemon=True)  # при регрессии поток повиснет — не держим им pytest
+        t.start()
+        # UI-цикл в это время стоит на done.wait — call_from_thread завис бы до его освобождения
+        assert done.wait(1), "emit индикатора ждёт интерфейс"
+        t.join(1)
+        await pilot.pause()
+        assert not any(e["kind"] == "activity" for e in s.events())
 
 
 @pytest.mark.asyncio

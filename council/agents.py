@@ -52,17 +52,21 @@ def resolve_exe(name_or_path: str) -> str:
 
 def kill_tree(proc: subprocess.Popen):
     """claude/codex — обёртки .cmd, настоящий node — их дочерний процесс. proc.kill() убил бы только
-    cmd.exe, а node продолжил бы работу и держал каналы вывода, так что communicate() завис бы."""
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-    else:
-        try:
+    cmd.exe, а node продолжил бы работу и держал каналы вывода, так что communicate() завис бы.
+    Никогда не бросает: вызывается перед raise Cancelled/AgentError и не должна подменять их причину."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+        else:
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    proc.kill()
-    proc.wait(timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 # сколько ждать конца вывода после выхода самого CLI (не дольше общего таймаута)
@@ -92,12 +96,17 @@ def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
                     pass
 
     def feed():
-        # запись в отдельном потоке: CLI, не читающий stdin, не должен блокировать отмену и таймаут
+        # запись в отдельном потоке: CLI, не читающий stdin, не должен блокировать отмену и таймаут.
+        # Ошибка записи (процесс вышел, не дочитав) не считается сбоем: код выхода скажет, что случилось.
         try:
             proc.stdin.write(prompt)
-            proc.stdin.close()
-        except (OSError, ValueError):  # процесс завершился, не дочитав stdin, — код выхода скажет почему
+        except (OSError, ValueError):
             pass
+        finally:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
 
     threads = [threading.Thread(target=pump, args=(proc.stdout, out_lines, on_line), daemon=True),
                threading.Thread(target=pump, args=(proc.stderr, err_lines, None), daemon=True),
@@ -130,6 +139,9 @@ def run_cli(cmd: list[str], prompt: str, cwd: Path, timeout: int,
                 t.join(timeout=0.1)
     finally:
         closed.set()
+        threads[2].join(timeout=1)  # writer после выхода процесса завершается сразу (EOF/BrokenPipe)
+    if cancel is not None and cancel.is_set():  # «Стоп» пришёл, пока дочитывали вывод
+        raise Cancelled()
     out, err = "".join(out_lines), "".join(err_lines)
     if proc.returncode != 0:
         tail = (err or out or "").strip()[-800:]

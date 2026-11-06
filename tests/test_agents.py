@@ -274,40 +274,79 @@ def test_claude_answers_without_activity_callback(monkeypatch, tmp_path):
     assert json.loads(ClaudeAgent().ask("p", tmp_path, [])) == {"position": "x"}
 
 
+def watchdog(fn, limit):
+    """Внешний предел для проверок зависаний: если run_cli завис, тест падает, а не висит вечно."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 — пробрасываем в тест
+            box["error"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t0 = time.monotonic()
+    t.start()
+    t.join(limit)
+    assert not t.is_alive(), f"run_cli завис дольше {limit} с"
+    box["seconds"] = time.monotonic() - t0
+    return box
+
+
 def test_big_stdin_without_reader_respects_timeout_and_cancel(tmp_path):
     # ревью совета PR #7: запись промпта в основном потоке блокировалась, и таймаут/отмена не срабатывали
     sleeper = [sys.executable, "-c", "import time; time.sleep(5)"]
-    t0 = time.monotonic()
-    with pytest.raises(AgentError, match="таймаут"):
-        run_cli(sleeper, "x" * 1_000_000, tmp_path, timeout=0.5)
-    assert time.monotonic() - t0 < 3
+    box = watchdog(lambda: run_cli(sleeper, "x" * 1_000_000, tmp_path, timeout=0.5), 4)
+    assert isinstance(box.get("error"), AgentError) and "таймаут" in str(box["error"])
     cancel = threading.Event()
     threading.Timer(0.3, cancel.set).start()
-    t0 = time.monotonic()
-    with pytest.raises(Cancelled):
-        run_cli(sleeper, "x" * 1_000_000, tmp_path, 30, cancel)
-    assert time.monotonic() - t0 < 3
+    box = watchdog(lambda: run_cli(sleeper, "x" * 1_000_000, tmp_path, 30, cancel), 4)
+    assert isinstance(box.get("error"), Cancelled)
 
 
-def test_children_holding_output_are_not_a_success(tmp_path, monkeypatch):
-    # обёртка вышла, а её потомок держит stdout: раньше run_cli ждал его и возвращал успех
-    monkeypatch.setattr(agents, "EOF_GRACE", 0.5)
-    script = ("import subprocess, sys; "
-              "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']); "
+GRANDCHILD = ("import subprocess, sys; "
+              "subprocess.Popen([sys.executable, '-c', "
+              "'import time; time.sleep(1.5); print(\"late\", flush=True); time.sleep(1)']); "
               "print('early', flush=True)")
-    t0 = time.monotonic()
-    with pytest.raises(AgentError, match="не закрыли вывод"):
-        run_cli([sys.executable, "-c", script], "", tmp_path, timeout=60)
-    assert time.monotonic() - t0 < 3
 
 
-def test_no_activity_after_run_cli_returns(tmp_path):
+def test_children_holding_output_are_not_a_success_and_stay_silent(tmp_path, monkeypatch):
+    # обёртка вышла, а её потомок держит stdout: раньше run_cli ждал его и возвращал успех.
+    # На Windows taskkill по PID вышедшей обёртки потомка не находит — он ещё печатает «late»,
+    # и эта поздняя строка не должна дойти до индикатора
+    monkeypatch.setattr(agents, "EOF_GRACE", 0.3)
     seen = []
-    with pytest.raises(AgentError, match="таймаут"):
-        run_cli([sys.executable, "-c", "import time; print('a', flush=True); time.sleep(0.6); print('b')"],
-                "", tmp_path, timeout=0.3, on_line=seen.append)
-    time.sleep(1)
-    assert seen == ["a\n"]  # «b» после таймаута индикатору не передаётся
+    box = watchdog(lambda: run_cli([sys.executable, "-c", GRANDCHILD], "", tmp_path, 60,
+                                   on_line=seen.append), 5)
+    assert isinstance(box.get("error"), AgentError) and "не закрыли вывод" in str(box["error"])
+    time.sleep(2.5)  # потомок успевает напечатать «late» и выйти
+    assert seen == ["early\n"]
+
+
+def test_cancel_during_output_drain_wins_over_success(tmp_path):
+    cancel = threading.Event()
+    script = "print('a', flush=True)"
+
+    def on_line(line):
+        cancel.set()  # «Стоп», пока вывод ещё дочитывается
+
+    box = watchdog(lambda: run_cli([sys.executable, "-c", script], "", tmp_path, 30, cancel, on_line), 10)
+    assert isinstance(box.get("error"), Cancelled)
+
+
+def test_failed_cleanup_does_not_hide_the_reason(tmp_path, monkeypatch):
+    real_run = agents.subprocess.run
+
+    def broken_taskkill(*a, **k):
+        raise agents.subprocess.TimeoutExpired("taskkill", 15)
+
+    monkeypatch.setattr(agents.subprocess, "run", broken_taskkill)
+    try:
+        box = watchdog(lambda: run_cli([sys.executable, "-c", "import time; time.sleep(3)"], "",
+                                       tmp_path, timeout=0.3), 20)
+    finally:
+        monkeypatch.setattr(agents.subprocess, "run", real_run)
+    assert isinstance(box.get("error"), AgentError) and "таймаут" in str(box["error"])
 
 
 @pytest.mark.parametrize("command, shown", [
@@ -322,6 +361,28 @@ def test_no_activity_after_run_cli_returns(tmp_path):
     ("Invoke-Command -ComputerName x -Command 'dir'", "Invoke-Command -ComputerName x -Command 'dir'"),
     ("Get-Content \\\\server\\share\\a.txt", "Get-Content \\\\server\\share\\a.txt"),
     ("powershell.exe -Command 'Get-Content \\\\server\\share\\a.txt'", "Get-Content \\\\server\\share\\a.txt"),
+    # UNC внутри двойных кавычек: Codex удваивает каждый слэш, \\\\server → \\server
+    ('powershell.exe -Command "Get-Content \\\\\\\\server\\\\share\\\\a.txt"', "Get-Content \\\\server\\share\\a.txt"),
 ])
 def test_codex_command_strips_only_the_wrapper(command, shown):
     assert agents.codex_command(command) == shown
+
+
+# сырые строки `codex exec --json` (Codex CLI 0.166.0, 2026-11-06): путь к powershell в двойных кавычках —
+# слэши удвоены; команда в одинарных — как есть. Вторая: команда с одинарными кавычками внутри — в двойных.
+RAW_CODEX_LINES = [
+    (r'{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"\"C:\\\\WINDOWS'
+     r'\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command \u0027Get-Content -LiteralPath '
+     r'note.txt\u0027","aggregated_output":"","exit_code":null,"status":"in_progress"}}',
+     "выполняет Get-Content -LiteralPath note.txt"),
+    (r'{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"\"C:\\\\WINDOWS'
+     r'\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command \"Get-Content -LiteralPath '
+     r'\u0027C:\\\\tmp\\\\acttest\\\\note.txt\u0027\"","aggregated_output":"","exit_code":null,'
+     r'"status":"in_progress"}}',
+     "выполняет Get-Content -LiteralPath 'C:\\tmp\\acttest\\note.txt'"),
+]
+
+
+@pytest.mark.parametrize("line, shown", RAW_CODEX_LINES)
+def test_codex_activity_from_raw_cli_lines(line, shown):
+    assert agents.codex_activity(json.loads(line)) == [shown]

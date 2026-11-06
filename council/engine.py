@@ -5,6 +5,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -235,19 +236,19 @@ class Debate:
                 + json.dumps(state, ensure_ascii=False, indent=1))
 
     # --- вызов с проверкой схемы ---
-    def _progress(self, agent: Agent, state: str, seconds: float = 0.0, attempt: int = 0):
-        """Состояние участника для индикатора (transient: приложение не пишет его в протокол)."""
+    def _progress(self, agent: Agent, state: str, call: str, seconds: float = 0.0):
+        """Состояние участника для индикатора (transient: приложение не пишет его в протокол).
+        call — уникальный id попытки: номер раунда и попытки повторяются после «Стоп» → «Продолжить»."""
         self.emit({"kind": "progress", "agent": agent.name, "state": state, "round": self.round,
-                   "attempt": attempt, "seconds": round(seconds, 1)})
+                   "call": call, "seconds": round(seconds, 1)})
 
-    def _activity_sink(self, agent: Agent, attempt: int):
+    def _activity_sink(self, agent: Agent, call: str):
         """Что участник делает внутри вызова (читает файл, выполняет команду) — тоже только для индикатора.
-        Раунд и попытка фиксируются при создании: позднее событие не припишется следующей попытке."""
+        Событие помечено id своей попытки: опоздавшее не припишется следующей."""
         rnd = self.round
 
         def sink(text: str):
-            self.emit({"kind": "activity", "agent": agent.name, "text": text, "round": rnd,
-                       "attempt": attempt})
+            self.emit({"kind": "activity", "agent": agent.name, "text": text, "round": rnd, "call": call})
         return sink
 
     def _ask(self, agent: Agent, prompt: str, attachments: list[Path]) -> dict:
@@ -268,8 +269,9 @@ class Debate:
                          "Верни ТОЛЬКО один JSON-объект по схеме.")
             t0 = time.monotonic()
             agent.last_usage = None
-            self._progress(agent, "thinking" if attempt == 0 else "retry", attempt=attempt)
-            agent.on_activity = self._activity_sink(agent, attempt)
+            call = uuid.uuid4().hex[:12]
+            self._progress(agent, "thinking" if attempt == 0 else "retry", call)
+            agent.on_activity = self._activity_sink(agent, call)
             try:
                 raw = agent.ask(p, self.session.workdir, attachments, self.cancel)
                 account(t0)
@@ -277,7 +279,7 @@ class Debate:
                     raise ValueError("пустой ответ")
                 data = extract_json(raw)
                 validate(data, SCHEMA)
-                self._progress(agent, "done", spent["seconds"], attempt)
+                self._progress(agent, "done", call, spent["seconds"])
                 return {"ok": True, **data, "usage": spent}
             except Cancelled:
                 raise
@@ -287,7 +289,7 @@ class Debate:
                 last_err = (e.message if isinstance(e, ValidationError) else str(e))[:500]
                 self.emit({"kind": "warning", "agent": agent.name,
                            "text": f"попытка {attempt + 1}: {last_err}"})
-        self._progress(agent, "failed", spent["seconds"], attempt)
+        self._progress(agent, "failed", call, spent["seconds"])
         # сбой участника = несогласие, а не молчаливое ACCEPT
         return {"ok": False, "position": "", "critique": f"[сбой: {last_err}]", "questions": [],
                 "vote": "REJECT", "vote_id": "", "new_proposal": "", "egg": "", "usage": spent}
